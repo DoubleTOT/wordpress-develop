@@ -1,0 +1,6638 @@
+<?php
+/**
+ * Unit tests covering WP_REST_Comments_Controller functionality.
+ *
+ * @package WordPress
+ * @subpackage REST API
+ *
+ * @group restapi
+ */
+class WP_Test_REST_Comments_Controller extends WP_Test_REST_Controller_Testcase {
+	protected static int $superadmin_id;
+	protected static int $admin_id;
+	protected static int $editor_id;
+	protected static int $moderator_id;
+	protected static int $contributor_id;
+	protected static int $subscriber_id;
+	protected static int $author_id;
+	protected static array $user_ids = array();
+
+	protected static int $post_id;
+	protected static int $password_id;
+	protected static int $private_id;
+	protected static int $draft_id;
+	protected static int $trash_id;
+	protected static int $approved_id;
+	protected static int $hold_id;
+
+	protected static array $comment_ids  = array();
+	protected static int $total_comments = 30;
+	protected static int $per_page       = 50;
+	protected static int $num_notes      = 10;
+
+	public static function wpSetUpBeforeClass( WP_UnitTest_Factory $factory ) {
+		add_role(
+			'comment_moderator',
+			'Comment Moderator',
+			array(
+				'read'              => true,
+				'moderate_comments' => true,
+			)
+		);
+
+		self::$superadmin_id  = $factory->user->create(
+			array(
+				'role'       => 'administrator',
+				'user_login' => 'superadmin',
+			)
+		);
+		self::$admin_id       = $factory->user->create(
+			array(
+				'role' => 'administrator',
+			)
+		);
+		self::$editor_id      = $factory->user->create(
+			array(
+				'role' => 'editor',
+			)
+		);
+		self::$moderator_id   = $factory->user->create(
+			array(
+				'role' => 'comment_moderator',
+			)
+		);
+		self::$contributor_id = $factory->user->create(
+			array(
+				'role' => 'contributor',
+			)
+		);
+		self::$subscriber_id  = $factory->user->create(
+			array(
+				'role' => 'subscriber',
+			)
+		);
+		self::$author_id      = $factory->user->create(
+			array(
+				'role'         => 'author',
+				'display_name' => 'Sea Captain',
+				'first_name'   => 'Horatio',
+				'last_name'    => 'McCallister',
+				'user_email'   => 'captain@thefryingdutchman.com',
+				'user_url'     => 'http://thefryingdutchman.com',
+			)
+		);
+
+		self::$post_id     = $factory->post->create();
+		self::$private_id  = $factory->post->create(
+			array(
+				'post_status' => 'private',
+			)
+		);
+		self::$password_id = $factory->post->create(
+			array(
+				'post_password' => 'toomanysecrets',
+			)
+		);
+		self::$draft_id    = $factory->post->create(
+			array(
+				'post_status' => 'draft',
+			)
+		);
+		self::$trash_id    = $factory->post->create(
+			array(
+				'post_status' => 'trash',
+			)
+		);
+
+		self::$approved_id = $factory->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => 0,
+			)
+		);
+		self::$hold_id     = $factory->comment->create(
+			array(
+				'comment_approved' => 0,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		self::$user_ids = array(
+			'superadmin'    => self::$superadmin_id,
+			'administrator' => self::$admin_id,
+			'editor'        => self::$editor_id,
+			'moderator'     => self::$moderator_id,
+			'contributor'   => self::$contributor_id,
+			'subscriber'    => self::$subscriber_id,
+			'author'        => self::$author_id,
+		);
+
+		// Set up comments for pagination tests.
+		for ( $i = 0; $i < self::$total_comments - 1; $i++ ) {
+			self::$comment_ids[] = $factory->comment->create(
+				array(
+					'comment_content' => "Comment {$i}",
+					'comment_post_ID' => self::$post_id,
+				)
+			);
+		}
+	}
+
+	public static function wpTearDownAfterClass() {
+		remove_role( 'comment_moderator' );
+
+		self::delete_user( self::$superadmin_id );
+		self::delete_user( self::$admin_id );
+		self::delete_user( self::$editor_id );
+		self::delete_user( self::$moderator_id );
+		self::delete_user( self::$contributor_id );
+		self::delete_user( self::$subscriber_id );
+		self::delete_user( self::$author_id );
+
+		wp_delete_post( self::$post_id, true );
+		wp_delete_post( self::$private_id, true );
+		wp_delete_post( self::$password_id, true );
+		wp_delete_post( self::$draft_id, true );
+		wp_delete_post( self::$trash_id, true );
+		wp_delete_post( self::$approved_id, true );
+		wp_delete_post( self::$hold_id, true );
+
+		// Remove comments for pagination tests.
+		foreach ( self::$comment_ids as $comment_id ) {
+			wp_delete_comment( $comment_id, true );
+		}
+	}
+
+	public function set_up() {
+		parent::set_up();
+		wp_create_initial_comment_meta();
+
+		if ( is_multisite() ) {
+			update_site_option( 'site_admins', array( 'superadmin' ) );
+		}
+	}
+
+	public function test_register_routes() {
+		$routes = rest_get_server()->get_routes();
+
+		$this->assertArrayHasKey( '/wp/v2/comments', $routes );
+		$this->assertCount( 2, $routes['/wp/v2/comments'] );
+		$this->assertArrayHasKey( '/wp/v2/comments/(?P<id>[\d]+)', $routes );
+		$this->assertCount( 3, $routes['/wp/v2/comments/(?P<id>[\d]+)'] );
+	}
+
+	public function test_context_param() {
+		// Collection.
+		$request  = new WP_REST_Request( 'OPTIONS', '/wp/v2/comments' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertSame( 'view', $data['endpoints'][0]['args']['context']['default'] );
+		$this->assertSame( array( 'view', 'embed', 'edit' ), $data['endpoints'][0]['args']['context']['enum'] );
+		// Single.
+		$request  = new WP_REST_Request( 'OPTIONS', '/wp/v2/comments/' . self::$approved_id );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertSame( 'view', $data['endpoints'][0]['args']['context']['default'] );
+		$this->assertSame( array( 'view', 'embed', 'edit' ), $data['endpoints'][0]['args']['context']['enum'] );
+	}
+
+	public function test_registered_query_params() {
+		$request  = new WP_REST_Request( 'OPTIONS', '/wp/v2/comments' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$keys     = array_keys( $data['endpoints'][0]['args'] );
+		sort( $keys );
+		$this->assertSame(
+			array(
+				'after',
+				'author',
+				'author_email',
+				'author_exclude',
+				'before',
+				'context',
+				'exclude',
+				'include',
+				'offset',
+				'order',
+				'orderby',
+				'page',
+				'parent',
+				'parent_exclude',
+				'password',
+				'per_page',
+				'post',
+				'search',
+				'status',
+				'type',
+			),
+			$keys
+		);
+	}
+
+	public function test_get_items() {
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comments = $response->get_data();
+		$this->assertCount( self::$total_comments, $comments );
+	}
+
+	/**
+	 * Test getting comments filtered by one or more statuses.
+	 *
+	 * @ticket 63982
+	 *
+	 * @dataProvider data_get_items_by_status
+	 *
+	 * @param string|list<string> $status Status value(s) to filter by.
+	 */
+	public function test_get_items_by_status( $status ) {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'status', $status );
+		$request->set_param( 'per_page', self::$per_page );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+
+		$query = new WP_Comment_Query();
+		$found = $query->query(
+			array(
+				'status' => $status,
+				'count'  => true,
+			)
+		);
+
+		$data = $response->get_data();
+		$this->assertIsArray( $data );
+		$this->assertCount( $found, $data );
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<string, array{ 0: string|list<string> }>
+	 */
+	public static function data_get_items_by_status(): array {
+		return array(
+			'a single status'        => array( 'approve' ),
+			'the hold status'        => array( 'hold' ),
+			'the all status'         => array( 'all' ),
+			'an array of statuses'   => array( array( 'approve', 'hold' ) ),
+			'a comma-separated list' => array( 'approve,hold' ),
+		);
+	}
+
+	/**
+	 * Test that filtering by the default status does not require authorization.
+	 *
+	 * @ticket 63982
+	 */
+	public function test_get_items_by_default_status_without_permission() {
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'status', 'approve' );
+		$request->set_param( 'per_page', self::$per_page );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+		$data = $response->get_data();
+		$this->assertIsArray( $data );
+		$this->assertCount( self::$total_comments, $data );
+	}
+
+	/**
+	 * Test that filtering by multiple statuses requires authorization.
+	 *
+	 * @ticket 63982
+	 *
+	 * @dataProvider data_get_items_by_multiple_statuses_without_permission
+	 *
+	 * @param string|list<string> $status Status value(s) to filter by.
+	 */
+	public function test_get_items_by_multiple_statuses_without_permission( $status ) {
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'status', $status );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_forbidden_param', $response, 401 );
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<string, array{ 0: string|list<string> }>
+	 */
+	public static function data_get_items_by_multiple_statuses_without_permission(): array {
+		return array(
+			'an array of statuses'   => array( array( 'approve', 'hold' ) ),
+			'a comma-separated list' => array( 'approve,hold' ),
+		);
+	}
+
+	/**
+	 * Test sanitization of the status parameter.
+	 *
+	 * @ticket 63982
+	 *
+	 * @dataProvider data_sanitize_comment_statuses
+	 *
+	 * @param string|string[]                  $statuses Raw status value.
+	 * @param list<non-empty-lowercase-string> $expected Expected sanitized statuses.
+	 */
+	public function test_sanitize_comment_statuses( $statuses, array $expected ) {
+		$controller = new WP_REST_Comments_Controller();
+
+		$this->assertSame( $expected, $controller->sanitize_comment_statuses( $statuses ) );
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<string, array{ 0: mixed, 1: list<non-empty-lowercase-string> }>
+	 */
+	public static function data_sanitize_comment_statuses(): array {
+		return array(
+			'a single status'        => array( 'approve', array( 'approve' ) ),
+			'a comma-separated list' => array( 'approve,hold', array( 'approve', 'hold' ) ),
+			'an array of statuses'   => array( array( 'approve', 'hold' ), array( 'approve', 'hold' ) ),
+			'mixed case statuses'    => array( 'APPROVE,Hold', array( 'approve', 'hold' ) ),
+			'duplicate statuses'     => array( array( 'approve', 'approve', 'hold' ), array( 'approve', 'hold' ) ),
+			'invalid characters'     => array( 'howdy&nbsp;admin', array( 'howdynbspadmin' ) ),
+			'an empty string'        => array( '', array() ),
+			'a literal 0 status'     => array( '0', array( '0' ) ),
+			'0 mixed with a status'  => array( '0,approve', array( '0', 'approve' ) ),
+		);
+	}
+
+	/**
+	 * @ticket 38692
+	 */
+	public function test_get_items_with_password() {
+		wp_set_current_user( 0 );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'password', 'toomanysecrets' );
+		$request->set_param( 'post', self::$password_id );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertContains( $password_comment, wp_list_pluck( $collection_data, 'id' ) );
+	}
+
+	/**
+	 * @ticket 38692
+	 */
+	public function test_get_items_with_password_without_post() {
+		wp_set_current_user( 0 );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'password', 'toomanysecrets' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertNotContains( $password_comment, wp_list_pluck( $collection_data, 'id' ) );
+	}
+
+	/**
+	 * @ticket 38692
+	 */
+	public function test_get_items_with_password_with_multiple_post() {
+		wp_set_current_user( 0 );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'password', 'toomanysecrets' );
+		$request->set_param( 'post', array( self::$password_id, self::$post_id ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read_post', $response, 401 );
+	}
+
+	public function test_get_password_items_without_edit_post_permission() {
+		wp_set_current_user( 0 );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertNotContains( $password_comment, wp_list_pluck( $collection_data, 'id' ) );
+	}
+
+	public function test_get_password_items_with_edit_post_permission() {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertContains( $password_comment, wp_list_pluck( $collection_data, 'id' ) );
+	}
+
+	public function test_get_items_without_private_post_permission() {
+		wp_set_current_user( 0 );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$private_id,
+		);
+
+		$private_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertNotContains( $private_comment, wp_list_pluck( $collection_data, 'id' ) );
+	}
+
+	public function test_get_items_with_private_post_permission() {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$private_id,
+		);
+
+		$private_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertContains( $private_comment, wp_list_pluck( $collection_data, 'id' ) );
+	}
+
+	public function test_get_items_with_invalid_post() {
+		wp_set_current_user( 0 );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => REST_TESTS_IMPOSSIBLY_HIGH_NUMBER,
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertNotContains( $comment_id, wp_list_pluck( $collection_data, 'id' ) );
+
+		wp_delete_comment( $comment_id );
+	}
+
+	public function test_get_items_with_invalid_post_permission() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => REST_TESTS_IMPOSSIBLY_HIGH_NUMBER,
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$collection_data = $response->get_data();
+		$this->assertContains( $comment_id, wp_list_pluck( $collection_data, 'id' ) );
+
+		wp_delete_comment( $comment_id );
+	}
+
+	public function test_get_items_no_permission_for_context() {
+		wp_set_current_user( 0 );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_forbidden_context', $response, 401 );
+	}
+
+	public function test_get_items_no_post() {
+		wp_set_current_user( self::$admin_id );
+
+		self::factory()->comment->create_post_comments( 0, 2 );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'post', 0 );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$comments = $response->get_data();
+		$this->assertCount( 2, $comments );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_items_no_permission_for_no_post( $method ) {
+		wp_set_current_user( 0 );
+
+		$request = new WP_REST_Request( $method, '/wp/v2/comments' );
+		$request->set_param( 'post', 0 );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read', $response, 401 );
+	}
+
+	/**
+	 * Data provider intended to provide HTTP method names for testing GET and HEAD requests.
+	 *
+	 * @return array
+	 */
+	public static function data_readable_http_methods() {
+		return array(
+			'GET request'  => array( 'GET' ),
+			'HEAD request' => array( 'HEAD' ),
+		);
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_items_edit_context( $method ) {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( $method, '/wp/v2/comments' );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_get_items_for_post() {
+		$second_post_id = self::factory()->post->create();
+		self::factory()->comment->create_post_comments( $second_post_id, 2 );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_query_params(
+			array(
+				'post' => $second_post_id,
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comments = $response->get_data();
+		$this->assertCount( 2, $comments );
+	}
+
+	public function test_get_items_include_query() {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+		);
+
+		$id1 = self::factory()->comment->create( $args );
+		$id2 = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		// 'order' => 'asc'.
+		$request->set_param( 'order', 'asc' );
+		$request->set_param( 'include', array( $id2, $id1 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertCount( 2, $data );
+		$this->assertSame( $id1, $data[0]['id'] );
+
+		// 'orderby' => 'include'.
+		$request->set_param( 'orderby', 'include' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertCount( 2, $data );
+		$this->assertSame( $id2, $data[0]['id'] );
+
+		// Invalid 'orderby' should error.
+		$request->set_param( 'orderby', 'invalid' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+
+		// Invalid 'include' should error.
+		$request->set_param( 'orderby', array( 'include' ) );
+		$request->set_param( 'include', array( 'invalid' ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_get_items_exclude_query() {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+		);
+
+		$id1 = self::factory()->comment->create( $args );
+		$id2 = self::factory()->comment->create( $args );
+
+		$request  = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$ids      = wp_list_pluck( $data, 'id' );
+		$this->assertContains( $id1, $ids );
+		$this->assertContains( $id2, $ids );
+
+		$request->set_param( 'exclude', array( $id2 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$ids      = wp_list_pluck( $data, 'id' );
+		$this->assertContains( $id1, $ids );
+		$this->assertNotContains( $id2, $ids );
+
+		// Invalid 'exclude' should error.
+		$request->set_param( 'exclude', array( 'invalid' ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_get_items_offset_query() {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$request->set_param( 'offset', 1 );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( self::$total_comments - 1, $response->get_data() );
+
+		// 'offset' works with 'per_page'.
+		$request->set_param( 'per_page', 2 );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( 2, $response->get_data() );
+
+		// 'offset' takes priority over 'page'.
+		$request->set_param( 'page', 3 );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( 2, $response->get_data() );
+
+		// Invalid 'offset' should error.
+		$request->set_param( 'offset', 'moreplease' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_get_items_order_query() {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+		);
+
+		$id = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+
+		// Order defaults to 'desc'.
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertSame( $id, $data[0]['id'] );
+
+		// 'order' => 'asc'.
+		$request->set_param( 'order', 'asc' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertSame( self::$approved_id, $data[0]['id'] );
+
+		// 'order' => 'asc,id' should error.
+		$request->set_param( 'order', 'asc,id' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_items_private_post_no_permissions( $method ) {
+		wp_set_current_user( 0 );
+
+		$request = new WP_REST_Request( $method, '/wp/v2/comments' );
+		$request->set_param( 'post', self::$private_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read_post', $response, 401 );
+	}
+
+	public function test_get_items_author_arg() {
+		// Authorized.
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+			'user_id'          => self::$author_id,
+		);
+
+		self::factory()->comment->create( $args );
+		$args['user_id'] = self::$subscriber_id;
+		self::factory()->comment->create( $args );
+		unset( $args['user_id'] );
+		self::factory()->comment->create( $args );
+
+		// Limit to comment author.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'author', self::$author_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$comments = $response->get_data();
+		$this->assertCount( 1, $comments );
+
+		// Multiple authors are supported.
+		$request->set_param( 'author', array( self::$author_id, self::$subscriber_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$comments = $response->get_data();
+		$this->assertCount( 2, $comments );
+
+		// Invalid 'author' should error.
+		$request->set_param( 'author', 'skippy' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+
+		// Unavailable to unauthenticated; defaults to error.
+		wp_set_current_user( 0 );
+		$request->set_param( 'author', array( self::$author_id, self::$subscriber_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_forbidden_param', $response, 401 );
+	}
+
+	public function test_get_items_author_exclude_arg() {
+		// Authorized.
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+			'user_id'          => self::$author_id,
+		);
+
+		self::factory()->comment->create( $args );
+		$args['user_id'] = self::$subscriber_id;
+		self::factory()->comment->create( $args );
+		unset( $args['user_id'] );
+		self::factory()->comment->create( $args );
+
+		$total_comments = self::$total_comments + 3;
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$response = rest_get_server()->dispatch( $request );
+		$comments = $response->get_data();
+		$this->assertCount( $total_comments, $comments );
+
+		// Exclude comment author.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$request->set_param( 'author_exclude', self::$author_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$comments = $response->get_data();
+		$this->assertCount( $total_comments - 1, $comments );
+
+		// Exclude both comment authors.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$request->set_param( 'author_exclude', array( self::$author_id, self::$subscriber_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$comments = $response->get_data();
+		$this->assertCount( $total_comments - 2, $comments );
+
+		// 'author_exclude' for invalid author.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'author_exclude', 'skippy' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+
+		// Unavailable to unauthenticated; defaults to error.
+		wp_set_current_user( 0 );
+		$request->set_param( 'author_exclude', array( self::$author_id, self::$subscriber_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_forbidden_param', $response, 401 );
+	}
+
+	public function test_get_items_parent_arg() {
+		$args                   = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+		);
+		$parent_id              = self::factory()->comment->create( $args );
+		$parent_id2             = self::factory()->comment->create( $args );
+		$args['comment_parent'] = $parent_id;
+		self::factory()->comment->create( $args );
+		$args['comment_parent'] = $parent_id2;
+		self::factory()->comment->create( $args );
+
+		$total_comments = self::$total_comments + 4;
+
+		// All comments in the database.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( $total_comments, $response->get_data() );
+
+		// Limit to the parent.
+		$request->set_param( 'parent', $parent_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( 1, $response->get_data() );
+
+		// Limit to two parents.
+		$request->set_param( 'parent', array( $parent_id, $parent_id2 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( 2, $response->get_data() );
+
+		// Invalid 'parent' should error.
+		$request->set_param( 'parent', 'invalid' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_get_items_parent_exclude_arg() {
+		$args                   = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+		);
+		$parent_id              = self::factory()->comment->create( $args );
+		$parent_id2             = self::factory()->comment->create( $args );
+		$args['comment_parent'] = $parent_id;
+		self::factory()->comment->create( $args );
+		$args['comment_parent'] = $parent_id2;
+		self::factory()->comment->create( $args );
+
+		$total_comments = self::$total_comments + 4;
+
+		// All comments in the database.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( $total_comments, $response->get_data() );
+
+		// Exclude this particular parent.
+		$request->set_param( 'parent_exclude', $parent_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( $total_comments - 1, $response->get_data() );
+
+		// Exclude both comment parents.
+		$request->set_param( 'parent_exclude', array( $parent_id, $parent_id2 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( $total_comments - 2, $response->get_data() );
+
+		// Invalid 'parent_exclude' should error.
+		$request->set_param( 'parent_exclude', 'invalid' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_get_items_search_query() {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+			'comment_content'  => 'foo',
+			'comment_author'   => 'Homer J Simpson',
+		);
+
+		$id = self::factory()->comment->create( $args );
+
+		$total_comments = self::$total_comments + 1;
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'per_page', self::$per_page );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertCount( $total_comments, $response->get_data() );
+
+		// One matching comment.
+		$request->set_param( 'search', 'foo' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertCount( 1, $data );
+		$this->assertSame( $id, $data[0]['id'] );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comments_pagination_headers( $method ) {
+		$total_comments = self::$total_comments;
+		$total_pages    = (int) ceil( $total_comments / 10 );
+
+		wp_set_current_user( self::$admin_id );
+
+		// Start of the index.
+		$request  = new WP_REST_Request( $method, '/wp/v2/comments' );
+		$response = rest_get_server()->dispatch( $request );
+		$headers  = $response->get_headers();
+		$this->assertSame( (string) $total_comments, $headers['X-WP-Total'] );
+		$this->assertSame( (string) $total_pages, $headers['X-WP-TotalPages'] );
+		$next_link = add_query_arg(
+			array(
+				'page' => 2,
+			),
+			rest_url( '/wp/v2/comments' )
+		);
+		$this->assertStringNotContainsString( 'rel="prev"', $headers['Link'] );
+		$this->assertStringContainsString( '<' . $next_link . '>; rel="next"', $headers['Link'] );
+
+		// 3rd page.
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID' => self::$post_id,
+			)
+		);
+		++$total_comments;
+		++$total_pages;
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'page', 3 );
+		$response = rest_get_server()->dispatch( $request );
+		$headers  = $response->get_headers();
+		$this->assertSame( (string) $total_comments, $headers['X-WP-Total'] );
+		$this->assertSame( (string) $total_pages, $headers['X-WP-TotalPages'] );
+		$prev_link = add_query_arg(
+			array(
+				'page' => 2,
+			),
+			rest_url( '/wp/v2/comments' )
+		);
+		$this->assertStringContainsString( '<' . $prev_link . '>; rel="prev"', $headers['Link'] );
+		$next_link = add_query_arg(
+			array(
+				'page' => 4,
+			),
+			rest_url( '/wp/v2/comments' )
+		);
+		$this->assertStringContainsString( '<' . $next_link . '>; rel="next"', $headers['Link'] );
+
+		// Last page.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'page', $total_pages );
+		$response = rest_get_server()->dispatch( $request );
+		$headers  = $response->get_headers();
+		$this->assertSame( (string) $total_comments, $headers['X-WP-Total'] );
+		$this->assertSame( (string) $total_pages, $headers['X-WP-TotalPages'] );
+		$prev_link = add_query_arg(
+			array(
+				'page' => $total_pages - 1,
+			),
+			rest_url( '/wp/v2/comments' )
+		);
+		$this->assertStringContainsString( '<' . $prev_link . '>; rel="prev"', $headers['Link'] );
+		$this->assertStringNotContainsString( 'rel="next"', $headers['Link'] );
+
+		// Out of bounds.
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'page', 100 );
+		$response = rest_get_server()->dispatch( $request );
+		$headers  = $response->get_headers();
+		$this->assertSame( (string) $total_comments, $headers['X-WP-Total'] );
+		$this->assertSame( (string) $total_pages, $headers['X-WP-TotalPages'] );
+		$prev_link = add_query_arg(
+			array(
+				'page' => $total_pages,
+			),
+			rest_url( '/wp/v2/comments' )
+		);
+		$this->assertStringContainsString( '<' . $prev_link . '>; rel="prev"', $headers['Link'] );
+		$this->assertStringNotContainsString( 'rel="next"', $headers['Link'] );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comments_invalid_date( $method ) {
+		$request = new WP_REST_Request( $method, '/wp/v2/comments' );
+		$request->set_param( 'after', 'foo' );
+		$request->set_param( 'before', 'bar' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_get_comments_valid_date() {
+		$comment1 = self::factory()->comment->create(
+			array(
+				'comment_date'    => '2016-01-15T00:00:00Z',
+				'comment_post_ID' => self::$post_id,
+			)
+		);
+		$comment2 = self::factory()->comment->create(
+			array(
+				'comment_date'    => '2016-01-16T00:00:00Z',
+				'comment_post_ID' => self::$post_id,
+			)
+		);
+		$comment3 = self::factory()->comment->create(
+			array(
+				'comment_date'    => '2016-01-17T00:00:00Z',
+				'comment_post_ID' => self::$post_id,
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'after', '2016-01-15T00:00:00Z' );
+		$request->set_param( 'before', '2016-01-17T00:00:00Z' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+		$this->assertCount( 1, $data );
+		$this->assertSame( $comment2, $data[0]['id'] );
+	}
+
+	public function test_get_item() {
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->check_comment_data( $data, 'view', $response->get_links() );
+	}
+
+	public function test_prepare_item() {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_query_params(
+			array(
+				'context' => 'edit',
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->check_comment_data( $data, 'edit', $response->get_links() );
+	}
+
+	public function test_prepare_item_limit_fields() {
+		wp_set_current_user( self::$admin_id );
+
+		$endpoint = new WP_REST_Comments_Controller();
+		$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_param( 'context', 'edit' );
+		$request->set_param( '_fields', 'id,status' );
+		$obj      = get_comment( self::$approved_id );
+		$response = $endpoint->prepare_item_for_response( $obj, $request );
+		$this->assertSame(
+			array(
+				'id',
+				'status',
+			),
+			array_keys( $response->get_data() )
+		);
+	}
+
+	/**
+	 * @ticket 58238
+	 */
+	public function test_prepare_item_comment_text_filter() {
+		$filter = new MockAction();
+		add_filter( 'comment_text', array( $filter, 'filter' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 1, $filter->get_call_count() );
+		$this->assertCount( 3, $filter->get_args()[0] );
+	}
+
+	public function test_get_comment_author_avatar_urls() {
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$data = $response->get_data();
+		$this->assertArrayHasKey( 24, $data['author_avatar_urls'] );
+		$this->assertArrayHasKey( 48, $data['author_avatar_urls'] );
+		$this->assertArrayHasKey( 96, $data['author_avatar_urls'] );
+
+		$comment = get_comment( self::$approved_id );
+		// Ignore the subdomain, since get_avatar_url() randomly sets
+		// the Gravatar server when building the URL string.
+		$this->assertSame( substr( get_avatar_url( $comment->comment_author_email ), 9 ), substr( $data['author_avatar_urls'][96], 9 ) );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_invalid_id( $method ) {
+		$request = new WP_REST_Request( $method, '/wp/v2/comments/' . REST_TESTS_IMPOSSIBLY_HIGH_NUMBER );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_id', $response, 404 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_invalid_context( $method ) {
+		wp_set_current_user( 0 );
+
+		$request = new WP_REST_Request( $method, sprintf( '/wp/v2/comments/%s', self::$approved_id ) );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_forbidden_context', $response, 401 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_invalid_post_id( $method ) {
+		wp_set_current_user( 0 );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => REST_TESTS_IMPOSSIBLY_HIGH_NUMBER,
+			)
+		);
+
+		$request  = new WP_REST_Request( $method, '/wp/v2/comments/' . $comment_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_post_invalid_id', $response, 404 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_invalid_post_id_as_admin( $method ) {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => REST_TESTS_IMPOSSIBLY_HIGH_NUMBER,
+			)
+		);
+
+		$request  = new WP_REST_Request( $method, '/wp/v2/comments/' . $comment_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_post_invalid_id', $response, 404 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_not_approved( $method ) {
+		wp_set_current_user( 0 );
+
+		$request  = new WP_REST_Request( $method, sprintf( '/wp/v2/comments/%d', self::$hold_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read', $response, 401 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_not_approved_same_user( $method ) {
+		wp_set_current_user( self::$admin_id );
+
+		$request  = new WP_REST_Request( $method, sprintf( '/wp/v2/comments/%d', self::$hold_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_get_comment_with_children_link() {
+		$comment_id_1 = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$child_comment = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_parent'   => $comment_id_1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%s', $comment_id_1 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertArrayHasKey( 'children', $response->get_links() );
+	}
+
+	public function test_get_comment_without_children_link() {
+		$comment_id_1 = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%s', $comment_id_1 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertArrayNotHasKey( 'children', $response->get_links() );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_with_password_without_edit_post_permission( $method ) {
+		wp_set_current_user( self::$subscriber_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request  = new WP_REST_Request( $method, sprintf( '/wp/v2/comments/%s', $password_comment ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read', $response, 403 );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 38692
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_comment_with_password_with_valid_password( $method ) {
+		wp_set_current_user( self::$subscriber_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$password_id,
+		);
+
+		$password_comment = self::factory()->comment->create( $args );
+
+		$request = new WP_REST_Request( $method, sprintf( '/wp/v2/comments/%s', $password_comment ) );
+		$request->set_param( 'password', 'toomanysecrets' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_create_item() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+			'date'         => '2014-11-07T10:14:25',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->check_comment_data( $data, 'edit', $response->get_links() );
+		$this->assertSame( 'hold', $data['status'] );
+		$this->assertSame( '2014-11-07T10:14:25', $data['date'] );
+		$this->assertSame( self::$post_id, $data['post'] );
+	}
+
+	public static function data_comment_dates() {
+		return array(
+			'set date without timezone'     => array(
+				'params'  => array(
+					'timezone_string' => 'America/New_York',
+					'date'            => '2016-12-12T14:00:00',
+				),
+				'results' => array(
+					'date'     => '2016-12-12T14:00:00',
+					'date_gmt' => '2016-12-12T19:00:00',
+				),
+			),
+			'set date_gmt without timezone' => array(
+				'params'  => array(
+					'timezone_string' => 'America/New_York',
+					'date_gmt'        => '2016-12-12T19:00:00',
+				),
+				'results' => array(
+					'date'     => '2016-12-12T14:00:00',
+					'date_gmt' => '2016-12-12T19:00:00',
+				),
+			),
+			'set date with timezone'        => array(
+				'params'  => array(
+					'timezone_string' => 'America/New_York',
+					'date'            => '2016-12-12T18:00:00-01:00',
+				),
+				'results' => array(
+					'date'     => '2016-12-12T14:00:00',
+					'date_gmt' => '2016-12-12T19:00:00',
+				),
+			),
+			'set date_gmt with timezone'    => array(
+				'params'  => array(
+					'timezone_string' => 'America/New_York',
+					'date_gmt'        => '2016-12-12T18:00:00-01:00',
+				),
+				'results' => array(
+					'date'     => '2016-12-12T14:00:00',
+					'date_gmt' => '2016-12-12T19:00:00',
+				),
+			),
+		);
+	}
+
+	/**
+	 * @dataProvider data_comment_dates
+	 */
+	public function test_create_comment_date( $params, $results ) {
+		wp_set_current_user( self::$admin_id );
+
+		update_option( 'timezone_string', $params['timezone_string'] );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->set_param( 'content', 'not empty' );
+		$request->set_param( 'post', self::$post_id );
+		if ( isset( $params['date'] ) ) {
+			$request->set_param( 'date', $params['date'] );
+		}
+		if ( isset( $params['date_gmt'] ) ) {
+			$request->set_param( 'date_gmt', $params['date_gmt'] );
+		}
+		$response = rest_get_server()->dispatch( $request );
+
+		update_option( 'timezone_string', '' );
+
+		$this->assertSame( 201, $response->get_status() );
+		$data    = $response->get_data();
+		$comment = get_comment( $data['id'] );
+
+		$this->assertSame( $results['date'], $data['date'] );
+		$comment_date = str_replace( 'T', ' ', $results['date'] );
+		$this->assertSame( $comment_date, $comment->comment_date );
+
+		$this->assertSame( $results['date_gmt'], $data['date_gmt'] );
+		$comment_date_gmt = str_replace( 'T', ' ', $results['date_gmt'] );
+		$this->assertSame( $comment_date_gmt, $comment->comment_date_gmt );
+	}
+
+	public function test_create_item_using_accepted_content_raw_value() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Reverend Lovejoy',
+			'author_email' => 'lovejoy@example.com',
+			'author_url'   => 'http://timothylovejoy.jr',
+			'content'      => array(
+				'raw' => 'Once something has been approved by the government, it\'s no longer immoral.',
+			),
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+		$this->assertSame( $params['content']['raw'], $new_comment->comment_content );
+	}
+
+	public function test_create_item_error_from_filter() {
+		add_filter( 'rest_pre_insert_comment', array( $this, 'return_premade_error' ) );
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'homer@example.org',
+			'content'      => array(
+				'raw' => 'Aw, he loves beer. Here, little fella.',
+			),
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'test_rest_premade_error', $response, 418 );
+	}
+
+	public function return_premade_error() {
+		return new WP_Error( 'test_rest_premade_error', "I'm sorry, I thought he was a party robot.", array( 'status' => 418 ) );
+	}
+
+	public function test_create_comment_missing_required_author_name() {
+		add_filter( 'rest_allow_anonymous_comments', '__return_true' );
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_email' => 'ekrabappel@springfield-elementary.edu',
+			'content'      => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_author_data_required', $response, 400 );
+	}
+
+	public function test_create_comment_empty_required_author_name() {
+		add_filter( 'rest_allow_anonymous_comments', '__return_true' );
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'author_name'  => '',
+			'author_email' => 'ekrabappel@springfield-elementary.edu',
+			'post'         => self::$post_id,
+			'content'      => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_author_data_required', $response, 400 );
+	}
+
+	public function test_create_comment_missing_required_author_email() {
+		wp_set_current_user( self::$admin_id );
+
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'post'        => self::$post_id,
+			'author_name' => 'Edna Krabappel',
+			'content'     => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_author_data_required', $response, 400 );
+	}
+
+	public function test_create_comment_empty_required_author_email() {
+		wp_set_current_user( self::$admin_id );
+
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Edna Krabappel',
+			'author_email' => '',
+			'content'      => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_author_data_required', $response, 400 );
+	}
+
+	public function test_create_comment_author_email_too_short() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer J. Simpson',
+			'author_email' => 'a@b',
+			'content'      => 'in this house, we obey the laws of thermodynamics!',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+
+		$data = $response->get_data();
+		$this->assertArrayHasKey( 'author_email', $data['data']['params'] );
+	}
+
+	public function test_create_item_invalid_no_content() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Reverend Lovejoy',
+			'author_email' => 'lovejoy@example.com',
+			'author_url'   => 'http://timothylovejoy.jr',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_content_invalid', $response, 400 );
+
+		$params['content'] = '';
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_content_invalid', $response, 400 );
+	}
+
+	/**
+	 * @ticket 43177
+	 */
+	public function test_create_item_invalid_only_spaces_content() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Reverend Lovejoy',
+			'author_email' => 'lovejoy@example.com',
+			'author_url'   => 'http://timothylovejoy.jr',
+			'content'      => '   ',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_content_invalid', $response, 400 );
+	}
+
+	/**
+	 * @ticket 43177
+	 */
+	public function test_create_item_allows_0_as_content() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Reverend Lovejoy',
+			'author_email' => 'lovejoy@example.com',
+			'author_url'   => 'http://timothylovejoy.jr',
+			'content'      => '0',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+		$this->assertSame( '0', $response->get_data()['content']['raw'] );
+	}
+
+	/**
+	 * @ticket 43177
+	 */
+	public function test_create_item_allow_empty_comment_filter() {
+		add_filter( 'allow_empty_comment', '__return_true' );
+
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Reverend Lovejoy',
+			'author_email' => 'lovejoy@example.com',
+			'author_url'   => 'http://timothylovejoy.jr',
+			'content'      => '',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+		$this->assertSame( '', $response->get_data()['content']['raw'] );
+	}
+
+	public function test_create_item_invalid_date() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Reverend Lovejoy',
+			'author_email' => 'lovejoy@example.com',
+			'author_url'   => 'http://timothylovejoy.jr',
+			'content'      => 'It\'s all over\, people! We don\'t have a prayer!',
+			'date'         => 'foo-bar',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+
+	public function test_create_item_assign_different_user() {
+		$subscriber_id = self::factory()->user->create(
+			array(
+				'role'       => 'subscriber',
+				'user_email' => 'cbg@androidsdungeon.com',
+			)
+		);
+
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'author'       => $subscriber_id,
+			'content'      => 'Worst Comment Ever!',
+			'date'         => '2014-11-07T10:14:25',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->assertSame( $subscriber_id, $data['author'] );
+		$this->assertSame( '127.0.0.1', $data['author_ip'] );
+	}
+
+	public function test_create_comment_without_type() {
+		$post_id = self::factory()->post->create();
+
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => $post_id,
+			'author'       => self::$admin_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+			'date'         => '2014-11-07T10:14:25',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->assertSame( 'comment', $data['type'] );
+
+		$comment_id = $data['id'];
+
+		// Make sure the new comment is present in the collection.
+		$collection = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$collection->set_param( 'post', $post_id );
+		$collection_response = rest_get_server()->dispatch( $collection );
+		$collection_data     = $collection_response->get_data();
+		$this->assertSame( $comment_id, $collection_data[0]['id'] );
+	}
+
+	/**
+	 * @ticket 38820
+	 */
+	public function test_create_comment_with_invalid_type() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author'       => self::$admin_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+			'date'         => '2014-11-07T10:14:25',
+			'type'         => 'foo',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_comment_type', $response, 400 );
+	}
+
+	public function test_create_comment_invalid_email() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author'       => self::$admin_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'hello:)',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+			'date'         => '2014-11-07T10:14:25',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_create_item_current_user() {
+		$user_id = self::factory()->user->create(
+			array(
+				'role'         => 'subscriber',
+				'user_email'   => 'lylelanley@example.com',
+				'first_name'   => 'Lyle',
+				'last_name'    => 'Lanley',
+				'display_name' => 'Lyle Lanley',
+				'user_url'     => 'http://simpsons.wikia.com/wiki/Lyle_Lanley',
+			)
+		);
+
+		wp_set_current_user( $user_id );
+
+		$params = array(
+			'post'    => self::$post_id,
+			'content' => "Well sir, there's nothing on earth like a genuine, bona fide, electrified, six-car Monorail!",
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 201, $response->get_status() );
+		$data = $response->get_data();
+		$this->assertSame( $user_id, $data['author'] );
+
+		// Check author data matches.
+		$author  = get_user_by( 'id', $user_id );
+		$comment = get_comment( $data['id'] );
+		$this->assertSame( $author->display_name, $comment->comment_author );
+		$this->assertSame( $author->user_email, $comment->comment_author_email );
+		$this->assertSame( $author->user_url, $comment->comment_author_url );
+	}
+
+	public function test_create_comment_other_user() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 201, $response->get_status() );
+		$data = $response->get_data();
+		$this->assertSame( self::$subscriber_id, $data['author'] );
+		$this->assertSame( 'Homer Jay Simpson', $data['author_name'] );
+		$this->assertSame( 'chunkylover53@aol.com', $data['author_email'] );
+		$this->assertSame( 'http://compuglobalhypermeganet.com', $data['author_url'] );
+	}
+
+	public function test_create_comment_other_user_without_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'author'       => self::$admin_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_invalid_author', $response, 403 );
+	}
+
+	public function test_create_comment_invalid_post() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => 'some-slug',
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_create_comment_status_without_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'author'       => self::$subscriber_id,
+			'status'       => 'approved',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_invalid_status', $response, 403 );
+	}
+
+	public function test_create_comment_with_status_IP_and_user_agent() {
+		$post_id = self::factory()->post->create();
+
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'              => $post_id,
+			'author_name'       => 'Comic Book Guy',
+			'author_email'      => 'cbg@androidsdungeon.com',
+			'author_ip'         => '139.130.4.5',
+			'author_url'        => 'http://androidsdungeon.com',
+			'author_user_agent' => 'Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36',
+			'content'           => 'Worst Comment Ever!',
+			'status'            => 'approved',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->assertSame( 'approved', $data['status'] );
+		$this->assertSame( '139.130.4.5', $data['author_ip'] );
+		$this->assertSame( 'Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36', $data['author_user_agent'] );
+	}
+
+	public function test_create_comment_user_agent_header() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->add_header( 'User_Agent', 'Mozilla/4.0 (compatible; MSIE 5.5; AOL 4.0; Windows 95)' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data = $response->get_data();
+
+		$new_comment = get_comment( $data['id'] );
+		$this->assertSame( 'Mozilla/4.0 (compatible; MSIE 5.5; AOL 4.0; Windows 95)', $new_comment->comment_agent );
+	}
+
+	public function test_create_comment_author_ip() {
+		wp_set_current_user( self::$admin_id );
+
+		$params  = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'author_ip'    => '127.0.0.3',
+			'content'      => 'Worst Comment Ever!',
+			'status'       => 'approved',
+		);
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response    = rest_get_server()->dispatch( $request );
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+		$this->assertSame( '127.0.0.3', $new_comment->comment_author_IP );
+	}
+
+	public function test_create_comment_invalid_author_IP() {
+		wp_set_current_user( self::$admin_id );
+
+		$params  = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'author_ip'    => '867.5309',
+			'content'      => 'Worst Comment Ever!',
+			'status'       => 'approved',
+		);
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_create_comment_author_ip_no_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'author_ip'    => '10.0.10.1',
+			'content'      => 'Worst Comment Ever!',
+			'status'       => 'approved',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_author_ip', $response, 403 );
+	}
+
+	public function test_create_comment_author_ip_defaults_to_remote_addr() {
+		wp_set_current_user( self::$admin_id );
+
+		$_SERVER['REMOTE_ADDR'] = '127.0.0.2';
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response    = rest_get_server()->dispatch( $request );
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+		$this->assertSame( '127.0.0.2', $new_comment->comment_author_IP );
+	}
+
+	public function test_create_comment_no_post_id() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+			'status'       => 'approved',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_invalid_post_id', $response, 403 );
+	}
+
+	public function test_create_comment_no_post_id_no_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_post_id', $response, 403 );
+	}
+
+	/**
+	 * A missing post should be reported as a missing post, even when the request
+	 * also sets `status` and the user is not allowed to set it.
+	 *
+	 * @ticket 65761
+	 */
+	public function test_create_comment_status_and_no_post_id_no_permission() {
+		wp_set_current_user( self::$author_id );
+
+		$params = array(
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'status'       => 'approved',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_post_id', $response, 403 );
+	}
+
+	public function test_create_comment_invalid_post_id() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'Here\’s to alcohol: the cause of, and solution to, all of life\’s problems.',
+			'status'       => 'approved',
+			'post'         => REST_TESTS_IMPOSSIBLY_HIGH_NUMBER,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_post_id', $response, 403 );
+	}
+
+	public function test_create_comment_draft_post() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$draft_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Call me Ishmael.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_draft_post', $response, 403 );
+	}
+
+	public function test_create_comment_trash_post() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$trash_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Call me Ishmael.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_trash_post', $response, 403 );
+	}
+
+	public function test_create_comment_private_post_invalid_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$private_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'I\’d be a vegetarian if bacon grew on trees.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read_post', $response, 403 );
+	}
+
+	public function test_create_comment_password_post_invalid_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$password_id,
+			'author_name'  => 'Homer Jay Simpson',
+			'author_email' => 'chunkylover53@aol.com',
+			'author_url'   => 'http://compuglobalhypermeganet.com',
+			'content'      => 'I\’d be a vegetarian if bacon grew on trees.',
+			'author'       => self::$subscriber_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_read_post', $response, 403 );
+	}
+
+	public function test_create_item_duplicate() {
+		wp_set_current_user( self::$subscriber_id );
+
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'      => self::$post_id,
+				'comment_author'       => 'Guy N. Cognito',
+				'comment_author_email' => 'chunkylover53@aol.co.uk',
+				'comment_content'      => 'Homer? Who is Homer? My name is Guy N. Cognito.',
+			)
+		);
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Guy N. Cognito',
+			'author_email' => 'chunkylover53@aol.co.uk',
+			'content'      => 'Homer? Who is Homer? My name is Guy N. Cognito.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 409, $response->get_status() );
+	}
+
+	public function test_create_comment_closed() {
+		$post_id = self::factory()->post->create(
+			array(
+				'comment_status' => 'closed',
+			)
+		);
+
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post' => $post_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 403, $response->get_status() );
+	}
+
+	public function test_create_comment_require_login() {
+		wp_set_current_user( 0 );
+
+		update_option( 'comment_registration', 1 );
+		add_filter( 'rest_allow_anonymous_comments', '__return_true' );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->set_param( 'post', self::$post_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 401, $response->get_status() );
+		$data = $response->get_data();
+		$this->assertSame( 'rest_comment_login_required', $data['code'] );
+	}
+
+	public function test_create_item_invalid_author() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'    => self::$post_id,
+			'author'  => REST_TESTS_IMPOSSIBLY_HIGH_NUMBER,
+			'content' => 'It\'s all over\, people! We don\'t have a prayer!',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_author_invalid', $response, 400 );
+	}
+
+	public function test_create_item_pull_author_info() {
+		wp_set_current_user( self::$admin_id );
+
+		$author = new WP_User( self::$author_id );
+		$params = array(
+			'post'    => self::$post_id,
+			'author'  => self::$author_id,
+			'content' => 'It\'s all over\, people! We don\'t have a prayer!',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$result = $response->get_data();
+		$this->assertSame( self::$author_id, $result['author'] );
+		$this->assertSame( 'Sea Captain', $result['author_name'] );
+		$this->assertSame( 'captain@thefryingdutchman.com', $result['author_email'] );
+		$this->assertSame( 'http://thefryingdutchman.com', $result['author_url'] );
+	}
+
+	public function test_create_comment_two_times() {
+		add_filter( 'rest_allow_anonymous_comments', '__return_true' );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Shakes fist at sky',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 400, $response->get_status() );
+	}
+
+	public function anonymous_comments_callback_null() {
+		// I'm a plugin developer who forgot to include a return value
+		// for some code path in my 'rest_allow_anonymous_comments' filter.
+	}
+
+	public function test_allow_anonymous_comments_null() {
+		add_filter( 'rest_allow_anonymous_comments', array( $this, 'anonymous_comments_callback_null' ), 10, 2 );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Comic Book Guy',
+			'author_email' => 'cbg@androidsdungeon.com',
+			'author_url'   => 'http://androidsdungeon.com',
+			'content'      => 'Worst Comment Ever!',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'rest_allow_anonymous_comments', array( $this, 'anonymous_comments_callback_null' ) );
+
+		$this->assertErrorResponse( 'rest_comment_login_required', $response, 401 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_create_comment_author_name_too_long() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => rand_long_str( 246 ),
+			'author_email' => 'murphy@gingivitis.com',
+			'author_url'   => 'http://jazz.gingivitis.com',
+			'content'      => 'This isn\'t a saxophone. It\'s an umbrella.',
+			'date'         => '1995-04-30T10:22:00',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_author_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_create_comment_author_email_too_long() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Bleeding Gums Murphy',
+			'author_email' => 'murphy@' . rand_long_str( 190 ) . '.com',
+			'author_url'   => 'http://jazz.gingivitis.com',
+			'content'      => 'This isn\'t a saxophone. It\'s an umbrella.',
+			'date'         => '1995-04-30T10:22:00',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_author_email_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_create_comment_author_url_too_long() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Bleeding Gums Murphy',
+			'author_email' => 'murphy@gingivitis.com',
+			'author_url'   => 'http://jazz.' . rand_long_str( 185 ) . '.com',
+			'content'      => 'This isn\'t a saxophone. It\'s an umbrella.',
+			'date'         => '1995-04-30T10:22:00',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_author_url_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_create_comment_content_too_long() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Bleeding Gums Murphy',
+			'author_email' => 'murphy@gingivitis.com',
+			'author_url'   => 'http://jazz.gingivitis.com',
+			'content'      => rand_long_str( 66525 ),
+			'date'         => '1995-04-30T10:22:00',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_content_column_length', $response, 400 );
+	}
+
+	public function test_create_comment_without_password() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'         => self::$password_id,
+			'author_name'  => 'Bleeding Gums Murphy',
+			'author_email' => 'murphy@gingivitis.com',
+			'author_url'   => 'http://jazz.gingivitis.com',
+			'content'      => 'This isn\'t a saxophone. It\'s an umbrella.',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_read_post', $response, 403 );
+	}
+
+	public function test_create_comment_with_password() {
+		add_filter( 'rest_allow_anonymous_comments', '__return_true' );
+
+		$params = array(
+			'post'         => self::$password_id,
+			'author_name'  => 'Bleeding Gums Murphy',
+			'author_email' => 'murphy@gingivitis.com',
+			'author_url'   => 'http://jazz.gingivitis.com',
+			'content'      => 'This isn\'t a saxophone. It\'s an umbrella.',
+			'password'     => 'toomanysecrets',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+	}
+
+	public function test_update_item() {
+		$post_id = self::factory()->post->create();
+
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author'       => self::$subscriber_id,
+			'author_name'  => 'Disco Stu',
+			'author_url'   => 'http://stusdisco.com',
+			'author_email' => 'stu@stusdisco.com',
+			'author_ip'    => '4.4.4.4',
+			'content'      => 'Testing.',
+			'date'         => '2014-11-07T10:14:25',
+			'post'         => $post_id,
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comment = $response->get_data();
+		$updated = get_comment( self::$approved_id );
+		$this->assertSame( $params['content'], $comment['content']['raw'] );
+		$this->assertSame( $params['author'], $comment['author'] );
+		$this->assertSame( $params['author_name'], $comment['author_name'] );
+		$this->assertSame( $params['author_url'], $comment['author_url'] );
+		$this->assertSame( $params['author_email'], $comment['author_email'] );
+		$this->assertSame( $params['author_ip'], $comment['author_ip'] );
+		$this->assertSame( $params['post'], $comment['post'] );
+
+		$this->assertSame( mysql_to_rfc3339( $updated->comment_date ), $comment['date'] );
+		$this->assertSame( '2014-11-07T10:14:25', $comment['date'] );
+	}
+
+	/**
+	 * @dataProvider data_comment_dates
+	 */
+	public function test_update_comment_date( $params, $results ) {
+		wp_set_current_user( self::$editor_id );
+
+		update_option( 'timezone_string', $params['timezone_string'] );
+
+		$comment_id = self::factory()->comment->create();
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		if ( isset( $params['date'] ) ) {
+			$request->set_param( 'date', $params['date'] );
+		}
+		if ( isset( $params['date_gmt'] ) ) {
+			$request->set_param( 'date_gmt', $params['date_gmt'] );
+		}
+		$response = rest_get_server()->dispatch( $request );
+
+		update_option( 'timezone_string', '' );
+
+		$this->assertSame( 200, $response->get_status() );
+		$data    = $response->get_data();
+		$comment = get_comment( $data['id'] );
+
+		$this->assertSame( $results['date'], $data['date'] );
+		$comment_date = str_replace( 'T', ' ', $results['date'] );
+		$this->assertSame( $comment_date, $comment->comment_date );
+
+		$this->assertSame( $results['date_gmt'], $data['date_gmt'] );
+		$comment_date_gmt = str_replace( 'T', ' ', $results['date_gmt'] );
+		$this->assertSame( $comment_date_gmt, $comment->comment_date_gmt );
+	}
+
+	public function test_update_item_no_content() {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_param( 'author_email', 'another@email.com' );
+
+		// Sending a request without content is fine.
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		// Sending a request with empty comment is not fine.
+		$request->set_param( 'author_email', 'yetanother@email.com' );
+		$request->set_param( 'content', '' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_content_invalid', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64049
+	 */
+	public function test_update_item_no_content_allow_empty_comment_filter() {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_param( 'author_email', 'another@email.com' );
+
+		// Sending a request without content is fine.
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		// Sending a request with empty comment content is also fine.
+		$request->set_param( 'author_email', 'yetanother@email.com' );
+		$request->set_param( 'content', '' );
+		add_filter( 'allow_empty_comment', '__return_true' );
+		$response = rest_get_server()->dispatch( $request );
+		remove_filter( 'allow_empty_comment', '__return_true' );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_update_item_no_change() {
+		$comment = get_comment( self::$approved_id );
+
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_param( 'post', $comment->comment_post_ID );
+
+		// Run twice to make sure that the update still succeeds
+		// even if no DB rows are updated.
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_update_comment_status() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 0,
+				'comment_post_ID'  => self::$post_id,
+			)
+		);
+
+		$params = array(
+			'status' => 'approve',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comment = $response->get_data();
+		$updated = get_comment( $comment_id );
+		$this->assertSame( 'approved', $comment['status'] );
+		$this->assertSame( '1', $updated->comment_approved );
+	}
+
+	public function test_update_comment_field_does_not_use_default_values() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 0,
+				'comment_post_ID'  => self::$post_id,
+				'comment_content'  => 'some content',
+			)
+		);
+
+		$params = array(
+			'status' => 'approve',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comment = $response->get_data();
+		$updated = get_comment( $comment_id );
+		$this->assertSame( 'approved', $comment['status'] );
+		$this->assertSame( '1', $updated->comment_approved );
+		$this->assertSame( 'some content', $updated->comment_content );
+	}
+
+	public function test_update_comment_date_gmt() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'date_gmt' => '2015-05-07T10:14:25',
+			'content'  => 'I\'ll be deep in the cold, cold ground before I recognize Missouri.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comment = $response->get_data();
+		$updated = get_comment( self::$approved_id );
+		$this->assertSame( $params['date_gmt'], $comment['date_gmt'] );
+		$this->assertSame( $params['date_gmt'], mysql_to_rfc3339( $updated->comment_date_gmt ) );
+	}
+
+	public function test_update_comment_author_email_only() {
+		wp_set_current_user( self::$editor_id );
+
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_email' => 'ekrabappel@springfield-elementary.edu',
+			'content'      => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_update_comment_empty_author_name() {
+		wp_set_current_user( self::$editor_id );
+
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'author_name'  => '',
+			'author_email' => 'ekrabappel@springfield-elementary.edu',
+			'post'         => self::$post_id,
+			'content'      => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_update_comment_author_name_only() {
+		wp_set_current_user( self::$admin_id );
+
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'post'        => self::$post_id,
+			'author_name' => 'Edna Krabappel',
+			'content'     => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_update_comment_empty_author_email() {
+		wp_set_current_user( self::$admin_id );
+
+		update_option( 'require_name_email', 1 );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Edna Krabappel',
+			'author_email' => '',
+			'content'      => 'Now, I don\'t want you to worry class. These tests will have no affect on your grades. They merely determine your future social status and financial success. If any.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_update_comment_author_email_too_short() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Homer J. Simpson',
+			'author_email' => 'a@b',
+			'content'      => 'in this house, we obey the laws of thermodynamics!',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+		$data = $response->get_data();
+		$this->assertArrayHasKey( 'author_email', $data['data']['params'] );
+	}
+
+	public function test_update_comment_invalid_type() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'type' => 'trackback',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_type', $response, 404 );
+	}
+
+	public function test_update_comment_with_raw_property() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'content' => array(
+				'raw' => 'What the heck kind of name is Persephone?',
+			),
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+
+		$comment = $response->get_data();
+		$updated = get_comment( self::$approved_id );
+		$this->assertSame( $params['content']['raw'], $updated->comment_content );
+	}
+
+	public function test_update_item_invalid_date() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'content' => 'content',
+			'date'    => 'foo',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_update_item_invalid_date_gmt() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'content'  => 'content',
+			'date_gmt' => 'foo',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+	}
+
+	public function test_update_comment_invalid_id() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'content' => 'Oh, they have the internet on computers now!',
+		);
+
+		$request = new WP_REST_Request( 'PUT', '/wp/v2/comments/' . REST_TESTS_IMPOSSIBLY_HIGH_NUMBER );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_id', $response, 404 );
+	}
+
+	public function test_update_comment_invalid_post_id() {
+		wp_set_current_user( self::$admin_id );
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_param( 'post', REST_TESTS_IMPOSSIBLY_HIGH_NUMBER );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_post_id', $response, 403 );
+	}
+
+	public function test_update_comment_invalid_permission() {
+		add_filter( 'rest_allow_anonymous_comments', '__return_true' );
+
+		$params = array(
+			'content' => 'Disco Stu likes disco music.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$hold_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_edit', $response, 401 );
+	}
+
+	/**
+	 * @ticket 47024
+	 */
+	public function test_update_comment_when_can_moderate_comments() {
+		wp_set_current_user( self::$moderator_id );
+
+		$params = array(
+			'content' => 'Updated comment.',
+			'date'    => '2019-10-07T23:14:25',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$comment = $response->get_data();
+		$updated = get_comment( self::$approved_id );
+
+		$this->assertSame( $params['content'], $updated->comment_content );
+		$this->assertSame( self::$post_id, $comment['post'] );
+		$this->assertSame( '2019-10-07T23:14:25', $comment['date'] );
+	}
+
+	public function test_update_comment_private_post_invalid_permission() {
+		$private_comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$private_id,
+				'user_id'          => 0,
+			)
+		);
+
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'content' => 'Disco Stu likes disco music.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', $private_comment_id ) );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_edit', $response, 403 );
+	}
+
+	public function test_update_comment_with_children_link() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id_1 = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$child_comment = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		// Check if comment 1 does not have the child link.
+		$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%s', $comment_id_1 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertArrayNotHasKey( 'children', $response->get_links() );
+
+		// Change the comment parent.
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%s', $child_comment ) );
+		$request->set_param( 'parent', $comment_id_1 );
+		$request->set_param( 'content', 'foo bar' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		// Check if comment 1 now has the child link.
+		$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%s', $comment_id_1 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertArrayHasKey( 'children', $response->get_links() );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_update_comment_author_name_too_long() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author_name' => rand_long_str( 246 ),
+			'content'     => 'This isn\'t a saxophone. It\'s an umbrella.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_author_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_update_comment_author_email_too_long() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author_email' => 'murphy@' . rand_long_str( 190 ) . '.com',
+			'content'      => 'This isn\'t a saxophone. It\'s an umbrella.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_author_email_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_update_comment_author_url_too_long() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author_url' => 'http://jazz.' . rand_long_str( 185 ) . '.com',
+			'content'    => 'This isn\'t a saxophone. It\'s an umbrella.',
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_author_url_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 38477
+	 */
+	public function test_update_comment_content_too_long() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'content' => rand_long_str( 66525 ),
+		);
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'comment_content_column_length', $response, 400 );
+	}
+
+	/**
+	 * @ticket 39732
+	 */
+	public function test_update_comment_is_wp_error() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'content' => 'This isn\'t a saxophone. It\'s an umbrella.',
+		);
+
+		add_filter( 'wp_update_comment_data', array( $this, '_wp_update_comment_data_filter' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'wp_update_comment_data', array( $this, '_wp_update_comment_data_filter' ) );
+
+		$this->assertErrorResponse( 'rest_comment_failed_edit', $response, 500 );
+	}
+
+	/**
+	 * Blocks comments from being updated by returning WP_Error.
+	 */
+	public function _wp_update_comment_data_filter( $data, $comment, $commentarr ) {
+		return new WP_Error( 'comment_wrong', 'wp_update_comment_data filter fails for this comment.', array( 'status' => 500 ) );
+	}
+
+	public function verify_comment_roundtrip( $input = array(), $expected_output = array() ) {
+		// Create the comment.
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->set_param( 'author_email', 'cbg@androidsdungeon.com' );
+		$request->set_param( 'post', self::$post_id );
+		foreach ( $input as $name => $value ) {
+			$request->set_param( $name, $value );
+		}
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+		$actual_output = $response->get_data();
+
+		// Compare expected API output to actual API output.
+		$this->assertIsArray( $actual_output['content'] );
+		$this->assertArrayHasKey( 'raw', $actual_output['content'] );
+		$this->assertSame( $expected_output['content']['raw'], $actual_output['content']['raw'] );
+		$this->assertSame( $expected_output['content']['rendered'], trim( $actual_output['content']['rendered'] ) );
+		$this->assertSame( $expected_output['author_name'], $actual_output['author_name'] );
+		$this->assertSame( $expected_output['author_user_agent'], $actual_output['author_user_agent'] );
+
+		// Compare expected API output to WP internal values.
+		$comment = get_comment( $actual_output['id'] );
+		$this->assertSame( $expected_output['content']['raw'], $comment->comment_content );
+		$this->assertSame( $expected_output['author_name'], $comment->comment_author );
+		$this->assertSame( $expected_output['author_user_agent'], $comment->comment_agent );
+
+		// Update the comment.
+		$request = new WP_REST_Request( 'PUT', sprintf( '/wp/v2/comments/%d', $actual_output['id'] ) );
+		foreach ( $input as $name => $value ) {
+			$request->set_param( $name, $value );
+		}
+		// FIXME At least one value must change, or update fails.
+		// See https://core.trac.wordpress.org/ticket/38700
+		$request->set_param( 'author_ip', '127.0.0.2' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$actual_output = $response->get_data();
+
+		// Compare expected API output to actual API output.
+		$this->assertSame( $expected_output['content']['raw'], $actual_output['content']['raw'] );
+		$this->assertSame( $expected_output['content']['rendered'], trim( $actual_output['content']['rendered'] ) );
+		$this->assertSame( $expected_output['author_name'], $actual_output['author_name'] );
+		$this->assertSame( $expected_output['author_user_agent'], $actual_output['author_user_agent'] );
+
+		// Compare expected API output to WP internal values.
+		$comment = get_comment( $actual_output['id'] );
+		$this->assertSame( $expected_output['content']['raw'], $comment->comment_content );
+		$this->assertSame( $expected_output['author_name'], $comment->comment_author );
+		$this->assertSame( $expected_output['author_user_agent'], $comment->comment_agent );
+	}
+
+	public function test_comment_roundtrip_as_editor() {
+		wp_set_current_user( self::$editor_id );
+
+		$this->assertSame( ! is_multisite(), current_user_can( 'unfiltered_html' ) );
+		$this->verify_comment_roundtrip(
+			array(
+				'content'           => '\o/ ¯\_(ツ)_/¯',
+				'author_name'       => '\o/ ¯\_(ツ)_/¯',
+				'author_user_agent' => '\o/ ¯\_(ツ)_/¯',
+			),
+			array(
+				'content'           => array(
+					'raw'      => '\o/ ¯\_(ツ)_/¯',
+					'rendered' => '<p>\o/ ¯\_(ツ)_/¯</p>',
+				),
+				'author_name'       => '\o/ ¯\_(ツ)_/¯',
+				'author_user_agent' => '\o/ ¯\_(ツ)_/¯',
+			)
+		);
+	}
+
+	public function test_comment_roundtrip_as_editor_unfiltered_html() {
+		wp_set_current_user( self::$editor_id );
+
+		if ( is_multisite() ) {
+			$this->assertFalse( current_user_can( 'unfiltered_html' ) );
+			$this->verify_comment_roundtrip(
+				array(
+					'content'           => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'author_name'       => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'author_user_agent' => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'author'            => self::$editor_id,
+				),
+				array(
+					'content'           => array(
+						'raw'      => 'div <strong>strong</strong> ',
+						'rendered' => '<p>div <strong>strong</strong> </p>',
+					),
+					'author_name'       => 'div strong',
+					'author_user_agent' => 'div strong',
+					'author'            => self::$editor_id,
+				)
+			);
+		} else {
+			$this->assertTrue( current_user_can( 'unfiltered_html' ) );
+			$this->verify_comment_roundtrip(
+				array(
+					'content'           => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'author_name'       => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'author_user_agent' => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'author'            => self::$editor_id,
+				),
+				array(
+					'content'           => array(
+						'raw'      => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+						'rendered' => "<div>div</div>\n<p> <strong>strong</strong> <script>oh noes</script></p>",
+					),
+					'author_name'       => 'div strong',
+					'author_user_agent' => 'div strong',
+					'author'            => self::$editor_id,
+				)
+			);
+		}
+	}
+
+	public function test_comment_roundtrip_as_superadmin() {
+		wp_set_current_user( self::$superadmin_id );
+
+		$this->assertTrue( current_user_can( 'unfiltered_html' ) );
+		$this->verify_comment_roundtrip(
+			array(
+				'content'           => '\\\&\\\ &amp; &invalid; < &lt; &amp;lt;',
+				'author_name'       => '\\\&\\\ &amp; &invalid; < &lt; &amp;lt;',
+				'author_user_agent' => '\\\&\\\ &amp; &invalid; < &lt; &amp;lt;',
+				'author'            => self::$superadmin_id,
+			),
+			array(
+				'content'           => array(
+					'raw'      => '\\\&\\\ &amp; &invalid; < &lt; &amp;lt;',
+					'rendered' => '<p>\\\&#038;\\\ &amp; &invalid; < &lt; &amp;lt;' . "\n</p>",
+				),
+				'author_name'       => '\\\&amp;\\\ &amp; &amp;invalid; &lt; &lt; &amp;lt;',
+				'author_user_agent' => '\\\&\\\ &amp; &invalid; &lt; &lt; &amp;lt;',
+				'author'            => self::$superadmin_id,
+			)
+		);
+	}
+
+	public function test_comment_roundtrip_as_superadmin_unfiltered_html() {
+		wp_set_current_user( self::$superadmin_id );
+
+		$this->assertTrue( current_user_can( 'unfiltered_html' ) );
+		$this->verify_comment_roundtrip(
+			array(
+				'content'           => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+				'author_name'       => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+				'author_user_agent' => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+				'author'            => self::$superadmin_id,
+			),
+			array(
+				'content'           => array(
+					'raw'      => '<div>div</div> <strong>strong</strong> <script>oh noes</script>',
+					'rendered' => "<div>div</div>\n<p> <strong>strong</strong> <script>oh noes</script></p>",
+				),
+				'author_name'       => 'div strong',
+				'author_user_agent' => 'div strong',
+				'author'            => self::$superadmin_id,
+			)
+		);
+	}
+
+	public function test_delete_item() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$request = new WP_REST_Request( 'DELETE', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		$request->set_param( 'force', 'false' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->assertSame( 'trash', $data['status'] );
+	}
+
+	public function test_delete_item_skip_trash() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$request          = new WP_REST_Request( 'DELETE', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		$request['force'] = true;
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$data = $response->get_data();
+		$this->assertTrue( $data['deleted'] );
+		$this->assertNotEmpty( $data['previous']['post'] );
+	}
+
+	public function test_delete_item_already_trashed() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$request  = new WP_REST_Request( 'DELETE', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$data     = $response->get_data();
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_already_trashed', $response, 410 );
+	}
+
+	public function test_delete_comment_invalid_id() {
+		wp_set_current_user( self::$admin_id );
+
+		$request  = new WP_REST_Request( 'DELETE', sprintf( '/wp/v2/comments/%d', REST_TESTS_IMPOSSIBLY_HIGH_NUMBER ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_id', $response, 404 );
+	}
+
+	public function test_delete_comment_without_permission() {
+		wp_set_current_user( self::$subscriber_id );
+
+		$request  = new WP_REST_Request( 'DELETE', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_cannot_delete', $response, 403 );
+	}
+
+	public function test_delete_child_comment_link() {
+		wp_set_current_user( self::$admin_id );
+
+		$comment_id_1 = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$child_comment = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_parent'   => $comment_id_1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$subscriber_id,
+			)
+		);
+
+		$request  = new WP_REST_Request( 'DELETE', sprintf( '/wp/v2/comments/%s', $child_comment ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		// Verify children link is gone.
+		$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%s', $comment_id_1 ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertArrayNotHasKey( 'children', $response->get_links() );
+	}
+
+	public function test_get_item_schema() {
+		$request    = new WP_REST_Request( 'OPTIONS', '/wp/v2/comments' );
+		$response   = rest_get_server()->dispatch( $request );
+		$data       = $response->get_data();
+		$properties = $data['schema']['properties'];
+		$this->assertCount( 18, $properties );
+		$this->assertArrayHasKey( 'id', $properties );
+		$this->assertArrayHasKey( 'author', $properties );
+		$this->assertArrayHasKey( 'author_avatar_urls', $properties );
+		$this->assertArrayHasKey( 'author_email', $properties );
+		$this->assertArrayHasKey( 'author_ip', $properties );
+		$this->assertArrayHasKey( 'author_name', $properties );
+		$this->assertArrayHasKey( 'author_url', $properties );
+		$this->assertArrayHasKey( 'author_user_agent', $properties );
+		$this->assertArrayHasKey( 'content', $properties );
+		$this->assertArrayHasKey( 'date', $properties );
+		$this->assertArrayHasKey( 'date_gmt', $properties );
+		$this->assertArrayHasKey( 'link', $properties );
+		$this->assertArrayHasKey( 'meta', $properties );
+		$this->assertArrayHasKey( 'parent', $properties );
+		$this->assertArrayHasKey( 'post', $properties );
+		$this->assertArrayHasKey( 'reaction_summary', $properties );
+		$this->assertArrayHasKey( 'status', $properties );
+		$this->assertArrayHasKey( 'type', $properties );
+
+		$this->assertSame( 0, $properties['parent']['default'] );
+		$this->assertSame( 0, $properties['post']['default'] );
+
+		$this->assertTrue( $properties['link']['readonly'] );
+		$this->assertTrue( $properties['type']['readonly'] );
+	}
+
+	public function test_get_item_schema_show_avatar() {
+		update_option( 'show_avatars', false );
+
+		$request    = new WP_REST_Request( 'OPTIONS', '/wp/v2/users' );
+		$response   = rest_get_server()->dispatch( $request );
+		$data       = $response->get_data();
+		$properties = $data['schema']['properties'];
+
+		$this->assertArrayNotHasKey( 'author_avatar_urls', $properties );
+	}
+
+	public function test_get_additional_field_registration() {
+
+		$schema = array(
+			'type'        => 'integer',
+			'description' => 'Some integer of mine',
+			'enum'        => array( 1, 2, 3, 4 ),
+			'context'     => array( 'view', 'edit' ),
+		);
+
+		register_rest_field(
+			'comment',
+			'my_custom_int',
+			array(
+				'schema'          => $schema,
+				'get_callback'    => array( $this, 'additional_field_get_callback' ),
+				'update_callback' => array( $this, 'additional_field_update_callback' ),
+			)
+		);
+
+		$request  = new WP_REST_Request( 'OPTIONS', '/wp/v2/comments' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+
+		$this->assertArrayHasKey( 'my_custom_int', $data['schema']['properties'] );
+		$this->assertSame( $schema, $data['schema']['properties']['my_custom_int'] );
+
+		$request  = new WP_REST_Request( 'GET', '/wp/v2/comments/' . self::$approved_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertArrayHasKey( 'my_custom_int', $response->data );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments/' . self::$approved_id );
+		$request->set_body_params(
+			array(
+				'my_custom_int' => 123,
+				'content'       => 'abc',
+			)
+		);
+
+		wp_set_current_user( 1 );
+		rest_get_server()->dispatch( $request );
+		$this->assertSame( '123', get_comment_meta( self::$approved_id, 'my_custom_int', true ) );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->set_body_params(
+			array(
+				'my_custom_int' => 123,
+				'title'         => 'hello',
+				'content'       => 'goodbye',
+				'post'          => self::$post_id,
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( '123', $response->data['my_custom_int'] );
+
+		global $wp_rest_additional_fields;
+		$wp_rest_additional_fields = array();
+	}
+
+	public function test_additional_field_update_errors() {
+		$schema = array(
+			'type'        => 'integer',
+			'description' => 'Some integer of mine',
+			'enum'        => array( 1, 2, 3, 4 ),
+			'context'     => array( 'view', 'edit' ),
+		);
+
+		register_rest_field(
+			'comment',
+			'my_custom_int',
+			array(
+				'schema'          => $schema,
+				'get_callback'    => array( $this, 'additional_field_get_callback' ),
+				'update_callback' => array( $this, 'additional_field_update_callback' ),
+			)
+		);
+
+		wp_set_current_user( self::$admin_id );
+
+		// Check for error on update.
+		$request = new WP_REST_Request( 'POST', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_body_params(
+			array(
+				'my_custom_int' => 'returnError',
+				'content'       => 'abc',
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_invalid_param', $response, 400 );
+
+		global $wp_rest_additional_fields;
+		$wp_rest_additional_fields = array();
+	}
+
+	public function additional_field_get_callback( $response_data, $field_name ) {
+		return get_comment_meta( $response_data['id'], $field_name, true );
+	}
+
+	public function additional_field_update_callback( $value, $comment, $field_name ) {
+		if ( 'returnError' === $value ) {
+			return new WP_Error( 'rest_invalid_param', 'Testing an error.', array( 'status' => 400 ) );
+		}
+		update_comment_meta( $comment->comment_ID, $field_name, $value );
+	}
+
+	protected function check_comment_data( $data, $context, $links ) {
+		$comment = get_comment( $data['id'] );
+
+		$this->assertSame( (int) $comment->comment_ID, $data['id'] );
+		$this->assertSame( (int) $comment->comment_post_ID, $data['post'] );
+		$this->assertSame( (int) $comment->comment_parent, $data['parent'] );
+		$this->assertSame( (int) $comment->user_id, $data['author'] );
+		$this->assertSame( $comment->comment_author, $data['author_name'] );
+		$this->assertSame( $comment->comment_author_url, $data['author_url'] );
+		$this->assertSame( wpautop( $comment->comment_content ), $data['content']['rendered'] );
+		$this->assertSame( mysql_to_rfc3339( $comment->comment_date ), $data['date'] );
+		$this->assertSame( mysql_to_rfc3339( $comment->comment_date_gmt ), $data['date_gmt'] );
+		$this->assertSame( get_comment_link( $comment ), $data['link'] );
+		$this->assertArrayHasKey( 'author_avatar_urls', $data );
+
+		$expected_links = array(
+			'self',
+			'collection',
+			'up',
+		);
+
+		if ( 'edit' === $context ) {
+			$expected_links[] = 'https://api.w.org/action-trash';
+		}
+
+		$this->assertSameSets( $expected_links, array_keys( $links ) );
+
+		if ( $comment->comment_post_ID ) {
+			$this->assertSame( rest_url( '/wp/v2/posts/' . $comment->comment_post_ID ), $links['up'][0]['href'] );
+		}
+
+		if ( 'edit' === $context ) {
+			$this->assertSame( $comment->comment_author_email, $data['author_email'] );
+			$this->assertSame( $comment->comment_author_IP, $data['author_ip'] );
+			$this->assertSame( $comment->comment_agent, $data['author_user_agent'] );
+			$this->assertSame( $comment->comment_content, $data['content']['raw'] );
+		} else {
+			$this->assertArrayNotHasKey( 'author_email', $data );
+			$this->assertArrayNotHasKey( 'author_ip', $data );
+			$this->assertArrayNotHasKey( 'author_user_agent', $data );
+			$this->assertArrayNotHasKey( 'raw', $data['content'] );
+		}
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 42238
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_check_read_post_permission_with_invalid_post_type( $method ) {
+		register_post_type(
+			'bug-post',
+			array(
+				'label'        => 'Bug Posts',
+				'supports'     => array( 'title', 'editor', 'author', 'comments' ),
+				'show_in_rest' => true,
+				'public'       => true,
+			)
+		);
+		create_initial_rest_routes();
+
+		$post_id    = self::factory()->post->create( array( 'post_type' => 'bug-post' ) );
+		$comment_id = self::factory()->comment->create( array( 'comment_post_ID' => $post_id ) );
+		_unregister_post_type( 'bug-post' );
+
+		$this->setExpectedIncorrectUsage( 'map_meta_cap' );
+
+		wp_set_current_user( self::$admin_id );
+		$request  = new WP_REST_Request( $method, '/wp/v2/comments/' . $comment_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 403, $response->get_status() );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method HTTP method to use.
+	 */
+	public function test_get_items_only_fetches_ids_for_head_requests( $method ) {
+		$is_head_request = 'HEAD' === $method;
+		$request         = new WP_REST_Request( $method, '/wp/v2/comments' );
+
+		$filter = new MockAction();
+
+		add_filter( 'comments_pre_query', array( $filter, 'filter' ), 10, 2 );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+		if ( $is_head_request ) {
+			$this->assertEmpty( $response->get_data() );
+		} else {
+			$this->assertNotEmpty( $response->get_data() );
+		}
+
+		$args = $filter->get_args();
+		$this->assertTrue( isset( $args[0][1] ), 'Query parameters were not captured.' );
+		$this->assertInstanceOf( WP_Comment_Query::class, $args[0][1], 'Query parameters were not captured.' );
+
+		/** @var WP_Comment_Query $query */
+		$query = $args[0][1];
+
+		if ( $is_head_request ) {
+			$this->assertArrayHasKey( 'fields', $query->query_vars, 'The fields parameter is not set in the query vars.' );
+			$this->assertSame( 'ids', $query->query_vars['fields'], 'The query must fetch only post IDs.' );
+			$this->assertArrayHasKey( 'update_comment_meta_cache', $query->query_vars, 'The update_comment_meta_cache key is missing in the query vars.' );
+			$this->assertFalse( $query->query_vars['update_comment_meta_cache'], 'The update_comment_meta_cache value should be false for HEAD requests.' );
+		} else {
+			$this->assertTrue( ! array_key_exists( 'fields', $query->query_vars ) || 'ids' !== $query->query_vars['fields'], 'The fields parameter should not be forced to "ids" for non-HEAD requests.' );
+			$this->assertArrayHasKey( 'update_comment_meta_cache', $query->query_vars, 'The update_comment_meta_cache key is missing in the query vars.' );
+			$this->assertTrue( $query->query_vars['update_comment_meta_cache'], 'The update_comment_meta_cache value should be true for non-HEAD requests.' );
+			return;
+		}
+
+		global $wpdb;
+		$comments_table = preg_quote( $wpdb->comments, '/' );
+		$pattern        = '/^SELECT\s+SQL_CALC_FOUND_ROWS\s+' . $comments_table . '\.comment_ID\s+FROM\s+' . $comments_table . '\s+WHERE/i';
+
+		// Assert that the SQL query only fetches the ID column.
+		$this->assertMatchesRegularExpression( $pattern, $query->request, 'The SQL query does not match the expected string.' );
+	}
+
+	/**
+	 * @dataProvider data_readable_http_methods
+	 * @ticket 56481
+	 *
+	 * @param string $method The HTTP method to use.
+	 */
+	public function test_get_item_should_allow_adding_headers_via_filter( $method ) {
+		$request = new WP_REST_Request( $method, sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+
+		$hook_name = 'rest_prepare_comment';
+
+		$filter   = new MockAction();
+		$callback = array( $filter, 'filter' );
+		add_filter( $hook_name, $callback );
+		$header_filter = new class() {
+			public static function add_custom_header( $response ) {
+				$response->header( 'X-Test-Header', 'Test' );
+
+				return $response;
+			}
+		};
+		add_filter( $hook_name, array( $header_filter, 'add_custom_header' ) );
+		$response = rest_get_server()->dispatch( $request );
+		remove_filter( $hook_name, $callback );
+		remove_filter( $hook_name, array( $header_filter, 'add_custom_header' ) );
+
+		$this->assertSame( 200, $response->get_status(), 'The response status should be 200.' );
+		$headers = $response->get_headers();
+		$this->assertSame( 1, $filter->get_call_count(), 'The "' . $hook_name . '" filter was called when it should not be for HEAD requests.' );
+		$this->assertArrayHasKey( 'X-Test-Header', $headers, 'The "X-Test-Header" header should be present in the response.' );
+		$this->assertSame( 'Test', $headers['X-Test-Header'], 'The "X-Test-Header" header value should be equal to "Test".' );
+		if ( 'HEAD' !== $method ) {
+			return null;
+		}
+		$this->assertSame( array(), $response->get_data(), 'The server should not generate a body in response to a HEAD request.' );
+	}
+
+	/**
+	 * @dataProvider data_head_request_with_specified_fields_returns_success_response
+	 * @ticket 56481
+	 *
+	 * @param string $path The path to test.
+	 */
+	public function test_head_request_with_specified_fields_returns_success_response( $path ) {
+		$request = new WP_REST_Request( 'HEAD', sprintf( $path, self::$approved_id ) );
+		$request->set_param( '_fields', 'id' );
+		$server   = rest_get_server();
+		$response = $server->dispatch( $request );
+		add_filter( 'rest_post_dispatch', 'rest_filter_response_fields', 10, 3 );
+		$response = apply_filters( 'rest_post_dispatch', $response, $server, $request );
+		remove_filter( 'rest_post_dispatch', 'rest_filter_response_fields', 10 );
+
+		$this->assertSame( 200, $response->get_status(), 'The response status should be 200.' );
+	}
+
+	/**
+	 * Data provider intended to provide paths for testing HEAD requests.
+	 *
+	 * @return array
+	 */
+	public static function data_head_request_with_specified_fields_returns_success_response() {
+		return array(
+			'get_item request'  => array( '/wp/v2/comments/%d' ),
+			'get_items request' => array( '/wp/v2/comments' ),
+		);
+	}
+
+	/**
+	 * Create a test post with note.
+	 *
+	 * @param string $role User role to assign the post author.
+	 * @return int Post ID.
+	 */
+	protected function create_test_post_with_note( $role ) {
+		$user_id = self::$user_ids[ $role ];
+		$post_id = self::factory()->post->create(
+			array(
+				'post_title'   => 'Test Post for Notes',
+				'post_content' => 'This is a test post to check note permissions.',
+				'post_status'  => 'contributor' === $role ? 'draft' : 'publish',
+				'post_author'  => $user_id,
+			)
+		);
+
+		for ( $i = 0; $i < self::$num_notes; $i++ ) {
+			self::factory()->comment->create(
+				array(
+					'comment_post_ID'  => $post_id,
+					'comment_type'     => 'note',
+					'comment_approved' => 0 === $i % 2 ? 1 : 0,
+				)
+			);
+		}
+
+		return $post_id;
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_cannot_read_note_without_post_type_support() {
+		register_post_type(
+			'no-notes',
+			array(
+				'label'        => 'No Notes',
+				'supports'     => array( 'title', 'editor', 'author', 'comments' ),
+				'show_in_rest' => true,
+				'public'       => true,
+			)
+		);
+
+		create_initial_rest_routes();
+		wp_set_current_user( self::$admin_id );
+
+		$post_id = self::factory()->post->create( array( 'post_type' => 'no-notes' ) );
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'post', $post_id );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'context', 'edit' );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_not_supported_post_type', $response, 403 );
+
+		_unregister_post_type( 'no-notes' );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_create_note_require_login() {
+		wp_set_current_user( 0 );
+
+		$post_id = self::factory()->post->create();
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->set_param( 'post', $post_id );
+		$request->set_param( 'type', 'note' );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_login_required', $response, 401 );
+	}
+
+	/**
+	 * Creating a note requires edit access to the target post.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_cannot_create_note_without_edit_post_capability() {
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+
+		wp_set_current_user( self::$subscriber_id );
+
+		$params = array(
+			'post'    => $post_id,
+			'content' => 'Subscriber note attempt',
+			'type'    => 'note',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_create_note', $response, rest_authorization_required_code() );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_cannot_create_note_without_post_type_support() {
+		register_post_type(
+			'no-note',
+			array(
+				'label'        => 'No Notes',
+				'supports'     => array( 'title', 'editor', 'author', 'comments' ),
+				'show_in_rest' => true,
+				'public'       => true,
+			)
+		);
+
+		wp_set_current_user( self::$admin_id );
+		$post_id = self::factory()->post->create( array( 'post_type' => 'no-note' ) );
+		$params  = array(
+			'post'         => $post_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Call me Ishmael.',
+			'author'       => self::$admin_id,
+			'type'         => 'note',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_not_supported_post_type', $response, 403 );
+
+		_unregister_post_type( 'no-note' );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_create_note_draft_post() {
+		wp_set_current_user( self::$editor_id );
+		$draft_id = self::factory()->post->create(
+			array(
+				'post_status' => 'draft',
+			)
+		);
+		$params   = array(
+			'post'         => $draft_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Call me Ishmael.',
+			'author'       => self::$editor_id,
+			'type'         => 'note',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response    = rest_get_server()->dispatch( $request );
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+		$this->assertSame( 'Call me Ishmael.', $new_comment->comment_content );
+		$this->assertSame( 'note', $new_comment->comment_type );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_create_note_status() {
+		wp_set_current_user( self::$author_id );
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$author_id ) );
+
+		$params = array(
+			'post'         => $post_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Comic Book Guy',
+			'author'       => self::$author_id,
+			'type'         => 'note',
+			'status'       => 'hold',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response    = rest_get_server()->dispatch( $request );
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+
+		$this->assertSame( '0', $new_comment->comment_approved );
+		$this->assertSame( 'note', $new_comment->comment_type );
+	}
+
+	/**
+	 * A missing post should be reported as a missing post for notes too.
+	 *
+	 * Without a post, the `status` capability check falls back to
+	 * `current_user_can( 'edit_post', 0 )`, which no role can satisfy. An
+	 * administrator is used here to show the missing post is reported even for a
+	 * user holding every capability.
+	 *
+	 * @ticket 65761
+	 */
+	public function test_create_note_status_and_no_post_id() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Comic Book Guy',
+			'type'         => 'note',
+			'status'       => 'hold',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_post_id', $response, 403 );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_cannot_create_with_non_valid_comment_type() {
+		wp_set_current_user( self::$admin_id );
+
+		$params = array(
+			'post'         => self::$post_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Comic Book Guy',
+			'author'       => self::$admin_id,
+			'type'         => 'review',
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_invalid_comment_type', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_create_assigns_default_type() {
+		wp_set_current_user( self::$editor_id );
+		$post_id = self::factory()->post->create();
+
+		$params = array(
+			'post'         => $post_id,
+			'author_name'  => 'Ishmael',
+			'author_email' => 'herman-melville@earthlink.net',
+			'author_url'   => 'https://en.wikipedia.org/wiki/Herman_Melville',
+			'content'      => 'Comic Book Guy',
+			'author'       => self::$editor_id,
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response    = rest_get_server()->dispatch( $request );
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+
+		$this->assertSame( 'comment', $new_comment->comment_type );
+	}
+
+	/**
+	 * @dataProvider data_note_status_provider
+	 * @ticket 64096
+	 */
+	public function test_create_empty_note_with_resolution_meta( $status ) {
+		wp_set_current_user( self::$editor_id );
+		$post_id = self::factory()->post->create();
+		$params  = array(
+			'post'         => $post_id,
+			'author_name'  => 'Editor',
+			'author_email' => 'editor@example.com',
+			'author_url'   => 'https://example.com',
+			'author'       => self::$editor_id,
+			'type'         => 'note',
+			'content'      => '',
+			'meta'         => array(
+				'_wp_note_status' => $status,
+			),
+		);
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->assertArrayHasKey( 'meta', $data );
+		$this->assertArrayHasKey( '_wp_note_status', $data['meta'] );
+		$this->assertSame( $status, $data['meta']['_wp_note_status'] );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_cannot_create_empty_note_without_resolution_meta() {
+		wp_set_current_user( self::$editor_id );
+		$post_id = self::factory()->post->create();
+		$params  = array(
+			'post'         => $post_id,
+			'author_name'  => 'Editor',
+			'author_email' => 'editor@example.com',
+			'author_url'   => 'https://example.com',
+			'author'       => self::$editor_id,
+			'type'         => 'note',
+			'content'      => '',
+		);
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_content_invalid', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_cannot_create_empty_note_with_invalid_resolution_meta() {
+		wp_set_current_user( self::$editor_id );
+		$post_id = self::factory()->post->create();
+		$params  = array(
+			'post'         => $post_id,
+			'author_name'  => 'Editor',
+			'author_email' => 'editor@example.com',
+			'author_url'   => 'https://example.com',
+			'author'       => self::$editor_id,
+			'type'         => 'note',
+			'content'      => '',
+			'meta'         => array(
+				'_wp_note_status' => 'invalid',
+			),
+		);
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_content_invalid', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_create_duplicate_note() {
+		wp_set_current_user( self::$editor_id );
+		$post_id = self::factory()->post->create();
+
+		for ( $i = 0; $i < 2; $i++ ) {
+			$params  = array(
+				'post'         => $post_id,
+				'author_name'  => 'Editor',
+				'author_email' => 'editor@example.com',
+				'author_url'   => 'https://example.com',
+				'author'       => self::$editor_id,
+				'type'         => 'note',
+				'content'      => 'Doplicated comment',
+			);
+			$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+			$request->add_header( 'Content-Type', 'application/json' );
+			$request->set_body( wp_json_encode( $params ) );
+			$response = rest_get_server()->dispatch( $request );
+			$this->assertSame( 201, $response->get_status() );
+		}
+	}
+
+	/**
+	 * @dataProvider data_note_get_items_permissions_data_provider
+	 * @ticket 64096
+	 */
+	public function test_note_get_items_permissions_edit_context( $role, $post_author_role, $can_read ) {
+		wp_set_current_user( self::$user_ids[ $role ] );
+		$post_id = $this->create_test_post_with_note( $post_author_role );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'post', $post_id );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'status', 'all' );
+		$request->set_param( 'per_page', 100 );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+
+		if ( $can_read ) {
+			$comments = $response->get_data();
+			$this->assertSame( self::$num_notes, count( $comments ) );
+		} else {
+			$this->assertErrorResponse( 'rest_forbidden_context', $response, 403 );
+		}
+
+		wp_delete_post( $post_id, true );
+	}
+
+	/**
+	 * @ticket 64096
+	 */
+	public function test_note_get_items_permissions_mixed_post_authors() {
+		$author_post_id = $this->create_test_post_with_note( 'author' );
+		$editor_post_id = $this->create_test_post_with_note( 'editor' );
+
+		wp_set_current_user( self::$author_id );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'post', array( $author_post_id, $editor_post_id ) );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'status', 'all' );
+		$request->set_param( 'per_page', 100 );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_forbidden_context', $response, 403 );
+
+		wp_delete_post( $author_post_id, true );
+		wp_delete_post( $editor_post_id, true );
+	}
+
+	/**
+	 * @dataProvider data_note_get_items_permissions_data_provider
+	 * @ticket 64096
+	 */
+	public function test_note_get_item_permissions_edit_context( $role, $post_author_role, $can_read ) {
+		wp_set_current_user( self::$user_ids[ $role ] );
+
+		$post_id = self::factory()->post->create(
+			array(
+				'post_title'   => 'Test Post for Block Comments',
+				'post_content' => 'This is a test post to check block comment permissions.',
+				'post_status'  => 'contributor' === $post_author_role ? 'draft' : 'publish',
+				'post_author'  => self::$user_ids[ $post_author_role ],
+			)
+		);
+
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				// Test with unapproved comment, which is more restrictive.
+				'comment_approved' => 0,
+				'user_id'          => self::$user_ids[ $post_author_role ],
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments/' . $comment_id );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+
+		if ( $can_read ) {
+			$comment = $response->get_data();
+			$this->assertSame( $comment_id, $comment['id'] );
+		} else {
+			$this->assertErrorResponse( 'rest_forbidden_context', $response, 403 );
+		}
+
+		wp_delete_post( $post_id, true );
+	}
+
+	public static function data_note_get_items_permissions_data_provider() {
+		return array(
+			'Administrator can see note on other posts'  => array( 'administrator', 'author', true ),
+			'Editor can see note on other posts'         => array( 'editor', 'contributor', true ),
+			'Author cannot see note on other posts'      => array( 'author', 'editor', false ),
+			'Contributor cannot see note on other posts' => array( 'contributor', 'author', false ),
+			'Subscriber cannot see note'                 => array( 'subscriber', 'author', false ),
+			'Author can see note on own post'            => array( 'author', 'author', true ),
+			'Contributor can see note on own post'       => array( 'contributor', 'contributor', true ),
+		);
+	}
+
+	public static function data_note_status_provider() {
+		return array(
+			'resolved' => array( 'resolved' ),
+			'reopen'   => array( 'reopen' ),
+		);
+	}
+
+	/**
+	 * Test children link for note comment type. Based on test_get_comment_with_children_link.
+	 *
+	 * @ticket 64152
+	 */
+	public function test_get_note_with_children_link() {
+		$parent_comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$admin_id,
+				'comment_type'     => 'note',
+				'comment_content'  => 'Parent note comment',
+			)
+		);
+
+		self::factory()->comment->create(
+			array(
+				'comment_approved' => 1,
+				'comment_parent'   => $parent_comment_id,
+				'comment_post_ID'  => self::$post_id,
+				'user_id'          => self::$admin_id,
+				'comment_type'     => 'note',
+				'comment_content'  => 'First child note comment',
+			)
+		);
+
+		wp_set_current_user( self::$admin_id );
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%s', $parent_comment_id ) );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$this->assertArrayHasKey( 'children', $response->get_links() );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'post', self::$post_id );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'context', 'edit' );
+		$request->set_param( 'parent', 0 );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status() );
+
+		$data = $response->get_data();
+
+		$this->assertArrayHasKey( '_links', $data[0] );
+		$this->assertArrayHasKey( 'children', $data[0]['_links'] );
+
+		$children = $data[0]['_links']['children'];
+
+		// Verify the href attribute contains the expected status and type parameters.
+		$this->assertStringContainsString( 'status=all', $children[0]['href'] );
+		$this->assertStringContainsString( 'type=note', $children[0]['href'] );
+	}
+
+	/**
+	 * @ticket 63670
+	 *
+	 * @covers WP_REST_Comments_Controller::get_available_actions
+	 */
+	public function test_trash_action_link_does_not_exist_when_not_trashable() {
+		add_filter( 'rest_comment_trashable', '__return_false' );
+		wp_set_current_user( self::$moderator_id );
+
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', self::$approved_id ) );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertArrayNotHasKey( 'https://api.w.org/action-trash', $response->get_links() );
+	}
+
+	/**
+	 * @ticket 63670
+	 *
+	 * @covers WP_REST_Comments_Controller::get_available_actions
+	 */
+	public function test_trash_action_link_does_not_exist_for_trashed_comment() {
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_approved' => 'trash',
+				'comment_post_ID'  => self::$post_id,
+			)
+		);
+		wp_set_current_user( self::$moderator_id );
+
+		$request = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', $comment_id ) );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertArrayNotHasKey( 'https://api.w.org/action-trash', $response->get_links() );
+	}
+
+	/**
+	 * Test retrieving comments by type as authenticated user.
+	 *
+	 * @dataProvider data_comment_type_provider
+	 * @ticket 44157
+	 *
+	 * @param string $comment_type The comment type to test.
+	 * @param int    $count        The number of comments to create.
+	 */
+	public function test_get_items_type_arg_authenticated( $comment_type, $count ) {
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+			'user_id'          => self::$author_id,
+			'comment_type'     => $comment_type,
+		);
+
+		// Create comments of the specified type.
+		for ( $i = 0; $i < $count; $i++ ) {
+			self::factory()->comment->create( $args );
+		}
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'type', $comment_type );
+		$request->set_param( 'per_page', self::$per_page );
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status(), 'Comments endpoint is expected to return a 200 status' );
+
+		$comments       = $response->get_data();
+		$expected_count = 'comment' === $comment_type ? $count + self::$total_comments : $count;
+		$this->assertCount( $expected_count, $comments, "comment type '{$comment_type}' is expect to have {$expected_count} comments" );
+
+		// Next, test getting the individual comments.
+		foreach ( $comments as $comment ) {
+			$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', $comment['id'] ) );
+			$response = rest_get_server()->dispatch( $request );
+
+			$this->assertSame( 200, $response->get_status(), 'Individual comment endpoint is expected to return a 200 status' );
+			$data = $response->get_data();
+			$this->assertSame( $comment_type, $data['type'], "Individual comment is expected to have type '{$comment_type}'" );
+		}
+	}
+
+	/**
+	 * Test retrieving comments by type as unauthenticated user.
+	 *
+	 * @dataProvider data_comment_type_provider
+	 * @ticket 44157
+	 *
+	 * @param string $comment_type The comment type to test.
+	 * @param int    $count        The number of comments to create.
+	 */
+	public function test_get_items_type_arg_unauthenticated( $comment_type, $count ) {
+		// First, create comments as admin.
+		wp_set_current_user( self::$admin_id );
+
+		$args = array(
+			'comment_approved' => 1,
+			'comment_post_ID'  => self::$post_id,
+			'user_id'          => self::$author_id,
+			'comment_type'     => $comment_type,
+		);
+
+		$comments = array();
+
+		for ( $i = 0; $i < $count; $i++ ) {
+			$comments[] = self::factory()->comment->create( $args );
+		}
+
+		// Log out and test as unauthenticated user.
+		wp_logout();
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'type', $comment_type );
+		$request->set_param( 'per_page', self::$per_page );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		// Only comments can be retrieved from the /comments (multiple) endpoint when unauthenticated.
+		$expected_status = 'comment' === $comment_type ? 200 : 401;
+		$this->assertSame( $expected_status, $response->get_status(), 'Comments endpoint did not return the expected status' );
+		if ( 'comment' !== $comment_type ) {
+			$this->assertErrorResponse( 'rest_forbidden_param', $response, 401, 'Comments endpoint did not return the expected error response for forbidden parameters' );
+		}
+
+		// Individual comments.
+		foreach ( $comments as $comment ) {
+			$request  = new WP_REST_Request( 'GET', sprintf( '/wp/v2/comments/%d', $comment ) );
+			$response = rest_get_server()->dispatch( $request );
+
+			// Individual comments using the /comments/<id> endpoint can be retrieved by
+			// unauthenticated users - except for the 'note' and 'reaction' types which are restricted.
+			// See https://core.trac.wordpress.org/ticket/44157.
+			$this->assertSame( in_array( $comment_type, array( 'note', 'reaction' ), true ) ? 401 : 200, $response->get_status(), 'Individual comment endpoint did not return the expected status' );
+		}
+	}
+
+	/**
+	 * Data provider for comment type tests.
+	 *
+	 * @return array[] Data provider.
+	 */
+	public static function data_comment_type_provider() {
+		return array(
+			'comment type'    => array( 'comment', 5 ),
+			'annotation type' => array( 'annotation', 5 ),
+			'discussion type' => array( 'discussion', 9 ),
+			'note type'       => array( 'note', 3 ),
+			'reaction type'   => array( 'reaction', 3 ),
+		);
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_reaction() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				// Open, like the editor creates it: an approved note is resolved.
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$data        = $response->get_data();
+		$new_comment = get_comment( $data['id'] );
+		$this->assertSame( '2764', $new_comment->comment_content );
+		$this->assertSame( 'reaction', $new_comment->comment_type );
+		$this->assertSame( (string) $note_id, $new_comment->comment_parent );
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_invalid_parent() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id    = self::factory()->post->create();
+		$comment_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'comment',
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Regular comment',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $comment_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_parent', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_no_parent() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_parent', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_invalid_emoji() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => 'thumbsup',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_reaction', $response, 400 );
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_duplicate() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		// Create first reaction.
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		// Attempt duplicate reaction.
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_duplicate_reaction', $response, 409 );
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_different_reactions_on_same_note() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		// Create first reaction.
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		// Create second, different reaction.
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '1f680',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+	}
+
+	/**
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_requires_login() {
+		wp_set_current_user( 0 );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_login_required', $response, 401 );
+	}
+
+	/**
+	 * Each curated reaction emoji is accepted by its hex key: the emoji's
+	 * lowercase code points, padded to four digits.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_curated_reaction_keys
+	 *
+	 * @param string $key The reaction hex key to submit.
+	 */
+	public function test_create_reaction_accepts_curated_key( $key ) {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => $key,
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$new_comment = get_comment( $response->get_data()['id'] );
+		$this->assertSame( $key, $new_comment->comment_content );
+	}
+
+	public static function data_curated_reaction_keys() {
+		return array(
+			'thumbs up'   => array( '1f44d' ),
+			'plus'        => array( '2795' ),
+			'2764'        => array( '2764' ),
+			'celebration' => array( '1f389' ),
+			'smile'       => array( '1f604' ),
+			'eyes'        => array( '1f440' ),
+			'1f680'       => array( '1f680' ),
+		);
+	}
+
+	/**
+	 * Raw emoji bytes must be rejected - clients are expected to normalize
+	 * to a curated hex key before submitting.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_rejects_raw_emoji() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '👍',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_reaction', $response, 400 );
+	}
+
+	/**
+	 * After trashing a reaction, the same user may re-add the same emoji
+	 * to the same note. Trashed reactions are invisible and must not block
+	 * re-adding.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_after_trashing_previous_one() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		// Existing reaction in trash should not block re-adding.
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 'trash',
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+	}
+
+	/**
+	 * A reaction whose parent note belongs to a different post is rejected.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_on_note_from_different_post() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id       = self::factory()->post->create();
+		$other_post_id = self::factory()->post->create();
+		$note_id       = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $other_post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Note on another post',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_parent', $response, 400 );
+	}
+
+
+	/**
+	 * Only the curated hex keys are accepted. Other emoji, even when
+	 * submitted as well-formed hex keys, are rejected, as are the slugs an
+	 * earlier version of the API accepted and keys that are not lowercase.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_uncurated_reaction_keys
+	 *
+	 * @param string $key The reaction content to submit.
+	 */
+	public function test_create_reaction_rejects_uncurated_key( $key ) {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => $key,
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_reaction', $response, 400 );
+	}
+
+	public static function data_uncurated_reaction_keys() {
+		return array(
+			'uncurated emoji'         => array( '1f525' ),
+			'ZWJ sequence'            => array( '1f468-200d-1f4bb' ),
+			'with variation selector' => array( '2764-fe0f' ),
+			'uppercase key'           => array( '1F680' ),
+			'slug'                    => array( 'heart' ),
+			'empty'                   => array( '' ),
+		);
+	}
+
+	/**
+	 * The stored reaction content is the validated, canonical key - markup
+	 * around the key must not reach the database, or `reaction_summary`
+	 * grouping would split visually identical reactions.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_stores_canonical_key() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '<b>2764</b>',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$new_comment = get_comment( $response->get_data()['id'] );
+		$this->assertSame( '2764', $new_comment->comment_content );
+	}
+
+	/**
+	 * Whitespace around the reaction key is trimmed before it is validated
+	 * and stored.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_trims_key() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'type'    => 'reaction',
+					'parent'  => $note_id,
+					'content' => " 2764\n",
+				)
+			)
+		);
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 201, $response->get_status() );
+		$this->assertSame( '2764', get_comment( $response->get_data()['id'] )->comment_content );
+	}
+
+	/**
+	 * A reaction can be sent in the object form of `content`, like any comment.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_accepts_raw_content_object() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => array( 'raw' => '1f680' ),
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+
+		$new_comment = get_comment( $response->get_data()['id'] );
+		$this->assertSame( '1f680', $new_comment->comment_content );
+	}
+
+	/**
+	 * The object form of `content` is validated like the string form, and only
+	 * its `raw` value is read.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_invalid_reaction_content_objects
+	 *
+	 * @param array $content The reaction content to submit.
+	 */
+	public function test_create_reaction_rejects_invalid_content_object( $content ) {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => $content,
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_reaction', $response, 400 );
+	}
+
+	public static function data_invalid_reaction_content_objects() {
+		return array(
+			'raw content not a key' => array( array( 'raw' => 'invalid_emoji' ) ),
+			'content without raw'   => array( array( 'rendered' => '2764' ) ),
+		);
+	}
+
+	/**
+	 * A reaction can only be created approved.
+	 *
+	 * Held, spammed or trashed reactions are invisible to the uniqueness check
+	 * and the reaction summary, so repeated requests could pile them up.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_create_reaction_status
+	 *
+	 * @param string $status          Requested status.
+	 * @param int    $expected_status Expected HTTP status.
+	 */
+	public function test_create_reaction_only_allows_approved_status( $status, $expected_status ) {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'status'  => $status,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+
+		if ( 201 === $expected_status ) {
+			$this->assertSame( 201, $response->get_status() );
+			$this->assertSame( '1', get_comment( $response->get_data()['id'] )->comment_approved );
+		} else {
+			$this->assertErrorResponse( 'rest_comment_invalid_status', $response, $expected_status );
+			$this->assertSame(
+				array(),
+				get_comments(
+					array(
+						'parent' => $note_id,
+						'type'   => 'reaction',
+						'status' => 'any',
+						'fields' => 'ids',
+					)
+				),
+				'No reaction should have been stored.'
+			);
+		}
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<string, array{0: string, 1: int}>
+	 */
+	public static function data_create_reaction_status() {
+		return array(
+			'approve' => array( 'approve', 201 ),
+			'hold'    => array( 'hold', 400 ),
+			'spam'    => array( 'spam', 400 ),
+			'trash'   => array( 'trash', 400 ),
+		);
+	}
+
+	/**
+	 * The pre-insert uniqueness check is not atomic. Simulate a concurrent
+	 * request winning the race — inserting the same reaction after this
+	 * request's check but before its own insert — and assert the post-insert
+	 * cleanup converges on a single surviving row.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_concurrent_duplicate_reaction_converges_to_single_row() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		/*
+		 * Insert a competing reaction while the request is mid-flight (after
+		 * its pre-insert check, before its own insert).
+		 */
+		$injected = false;
+		$inject   = function ( $prepared ) use ( $note_id, $post_id, &$injected ) {
+			if ( ! $injected && isset( $prepared['comment_type'] ) && 'reaction' === $prepared['comment_type'] ) {
+				$injected = true;
+				wp_insert_comment(
+					array(
+						'comment_post_ID'  => $post_id,
+						'comment_parent'   => $note_id,
+						'comment_type'     => 'reaction',
+						'comment_content'  => '2764',
+						'comment_approved' => 1,
+						'user_id'          => self::$editor_id,
+					)
+				);
+			}
+			return $prepared;
+		};
+		add_filter( 'rest_pre_insert_comment', $inject );
+
+		try {
+			$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+			$request->add_header( 'Content-Type', 'application/json' );
+			$request->set_body(
+				wp_json_encode(
+					array(
+						'post'    => $post_id,
+						'parent'  => $note_id,
+						'content' => '2764',
+						'type'    => 'reaction',
+						'author'  => self::$editor_id,
+					)
+				)
+			);
+			$response = rest_get_server()->dispatch( $request );
+			$this->assertSame( 201, $response->get_status() );
+		} finally {
+			remove_filter( 'rest_pre_insert_comment', $inject );
+		}
+
+		// Exactly one approved heart reaction should remain for this user/note.
+		$remaining = get_comments(
+			array(
+				'parent'  => $note_id,
+				'user_id' => self::$editor_id,
+				'type'    => 'reaction',
+				'status'  => 'approve',
+			)
+		);
+		$hearts    = array_values(
+			array_filter(
+				$remaining,
+				static function ( $comment ) {
+					return '2764' === $comment->comment_content;
+				}
+			)
+		);
+		$this->assertCount( 1, $hearts, 'Concurrent duplicate reactions should converge to a single row.' );
+
+		// The response must reference the surviving (earliest) row.
+		$this->assertSame( (int) $hearts[0]->comment_ID, $response->get_data()['id'] );
+	}
+
+	/**
+	 * The cleanup in create_item() must repoint to the surviving row even when
+	 * a competing request has already deleted this request's own row - the
+	 * losing side of the same race the test above covers from the winner.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_concurrent_cleanup_deleting_own_row_still_returns_survivor() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$survivor_id = 0;
+		$deleted     = false;
+
+		/*
+		 * Stand in for the competing request's cleanup: it keeps the earliest
+		 * row and deletes this request's later one, which lands first.
+		 */
+		$race = function ( $comment_id, $comment ) use ( &$survivor_id, &$deleted ) {
+			if ( ! $deleted && 'reaction' === $comment->comment_type && (int) $comment_id !== $survivor_id ) {
+				$deleted = true;
+				wp_delete_comment( $comment_id, true );
+			}
+		};
+
+		/*
+		 * Insert the competing row after this request's pre-insert uniqueness
+		 * check has passed, so it takes the earlier ID. Arm the cleanup only
+		 * once that row exists, so its own insert does not trigger it.
+		 */
+		$inject = function ( $prepared ) use ( $note_id, $post_id, $race, &$survivor_id ) {
+			if ( ! $survivor_id && isset( $prepared['comment_type'] ) && 'reaction' === $prepared['comment_type'] ) {
+				$survivor_id = wp_insert_comment(
+					array(
+						'comment_post_ID'  => $post_id,
+						'comment_parent'   => $note_id,
+						'comment_type'     => 'reaction',
+						'comment_content'  => '2764',
+						'comment_approved' => 1,
+						'user_id'          => self::$editor_id,
+					)
+				);
+				add_action( 'wp_insert_comment', $race, 10, 2 );
+			}
+			return $prepared;
+		};
+		add_filter( 'rest_pre_insert_comment', $inject );
+
+		try {
+			$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+			$request->add_header( 'Content-Type', 'application/json' );
+			$request->set_body(
+				wp_json_encode(
+					array(
+						'post'    => $post_id,
+						'parent'  => $note_id,
+						'content' => '2764',
+						'type'    => 'reaction',
+						'author'  => self::$editor_id,
+					)
+				)
+			);
+			$response = rest_get_server()->dispatch( $request );
+		} finally {
+			remove_filter( 'rest_pre_insert_comment', $inject );
+			remove_action( 'wp_insert_comment', $race, 10 );
+		}
+
+		$this->assertTrue( $deleted, "The race injection did not delete this request's row." );
+		$this->assertSame( 201, $response->get_status() );
+		$this->assertSame( $survivor_id, $response->get_data()['id'], 'The response did not repoint to the surviving row.' );
+	}
+
+	/**
+	 * Creates an approved reaction on a note, bypassing REST validation.
+	 *
+	 * @param int    $post_id Post the parent note belongs to.
+	 * @param int    $note_id Parent note comment ID.
+	 * @param int    $user_id Reacting user ID.
+	 * @param string $key     Reaction hex key.
+	 * @return int Reaction comment ID.
+	 */
+	private function create_reaction_for_update_tests( $post_id, $note_id, $user_id, $key = '2764' ) {
+		return self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_parent'   => $note_id,
+				'comment_type'     => 'reaction',
+				'comment_approved' => 1,
+				'comment_content'  => $key,
+				'user_id'          => $user_id,
+			)
+		);
+	}
+
+	/**
+	 * Reactions are validated as a set on create - author, parent note, target
+	 * post and canonical key - and the generic update route re-validates none
+	 * of it, so updating a reaction is not allowed at all.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_update_reaction_content_is_not_allowed() {
+		$post_id     = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = $this->create_reaction_for_update_tests( $post_id, $note_id, self::$editor_id );
+
+		wp_set_current_user( self::$editor_id );
+		$request = new WP_REST_Request( 'PUT', '/wp/v2/comments/' . $reaction_id );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( array( 'content' => '1f680' ) ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_update_not_allowed', $response, 403 );
+		$this->assertSame( '2764', get_comment( $reaction_id )->comment_content );
+	}
+
+	/**
+	 * The reactor's identity must not be reassignable through the update route.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_update_reaction_author_is_not_allowed() {
+		$post_id     = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = $this->create_reaction_for_update_tests( $post_id, $note_id, self::$author_id );
+
+		wp_set_current_user( self::$editor_id );
+		$request = new WP_REST_Request( 'PUT', '/wp/v2/comments/' . $reaction_id );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( array( 'author' => self::$editor_id ) ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_update_not_allowed', $response, 403 );
+		$this->assertSame( (string) self::$author_id, get_comment( $reaction_id )->user_id );
+	}
+
+	/**
+	 * A reaction must not be movable onto a note on a post the user cannot edit.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_update_reaction_cannot_move_to_note_on_another_post() {
+		$editable_post = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$other_post    = self::factory()->post->create( array( 'post_author' => self::$admin_id ) );
+
+		$note_id       = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $editable_post,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$other_note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $other_post,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$admin_id,
+				'comment_content'  => 'Other note',
+			)
+		);
+
+		$reaction_id = $this->create_reaction_for_update_tests( $editable_post, $note_id, self::$editor_id );
+
+		wp_set_current_user( self::$editor_id );
+		$request = new WP_REST_Request( 'PUT', '/wp/v2/comments/' . $reaction_id );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'parent' => $other_note_id,
+					'post'   => $other_post,
+				)
+			)
+		);
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_update_not_allowed', $response, 403 );
+
+		$reaction = get_comment( $reaction_id );
+		$this->assertSame( (string) $note_id, $reaction->comment_parent );
+		$this->assertSame( (string) $editable_post, $reaction->comment_post_ID );
+	}
+
+	/**
+	 * Only reactions are locked down; notes stay editable.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_update_note_is_still_allowed() {
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		wp_set_current_user( self::$editor_id );
+		$request = new WP_REST_Request( 'PUT', '/wp/v2/comments/' . $note_id );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( array( 'content' => 'Edited note' ) ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	/**
+	 * Creates a note on a post the given moderator cannot edit.
+	 *
+	 * @return array{0: int, 1: int} The note ID and the ID of a user who can moderate
+	 *                               comments but cannot edit the note's post.
+	 */
+	private function create_note_and_moderator_without_edit_access() {
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$moderator = self::factory()->user->create_and_get( array( 'role' => 'subscriber' ) );
+		$moderator->add_cap( 'moderate_comments' );
+
+		$this->assertFalse( user_can( $moderator, 'edit_post', $post_id ), 'The moderator should not be able to edit the post.' );
+
+		return array( $note_id, $moderator->ID );
+	}
+
+	/**
+	 * A user who can moderate comments but cannot edit the note's post cannot update the note.
+	 *
+	 * @ticket 65819
+	 */
+	public function test_moderator_without_edit_access_cannot_update_note() {
+		list( $note_id, $moderator_id ) = $this->create_note_and_moderator_without_edit_access();
+
+		wp_set_current_user( $moderator_id );
+		$request = new WP_REST_Request( 'PUT', '/wp/v2/comments/' . $note_id );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( array( 'content' => 'Edited note' ) ) );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_edit', $response, 403 );
+		$this->assertSame( 'Test note', get_comment( $note_id )->comment_content );
+	}
+
+	/**
+	 * A user who can moderate comments but cannot edit the note's post cannot delete the note.
+	 *
+	 * @ticket 65819
+	 */
+	public function test_moderator_without_edit_access_cannot_delete_note() {
+		list( $note_id, $moderator_id ) = $this->create_note_and_moderator_without_edit_access();
+
+		wp_set_current_user( $moderator_id );
+		$request = new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $note_id );
+		$request->set_param( 'force', true );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_delete', $response, 403 );
+		$this->assertInstanceOf( WP_Comment::class, get_comment( $note_id ) );
+	}
+
+	/**
+	 * The note response exposes a `reaction_summary` field aggregating
+	 * counts per emoji hex key, plus the current user's reaction ID as
+	 * `current_user_reaction`.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_note_response_includes_reaction_summary() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$heart_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$subscriber_id,
+				'comment_content'  => '1f680',
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments/' . $note_id );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+		$data     = $response->get_data();
+
+		$this->assertArrayHasKey( 'reaction_summary', $data );
+		$this->assertArrayHasKey( '2764', $data['reaction_summary'] );
+		$this->assertSame( 1, $data['reaction_summary']['2764']['count'] );
+		$this->assertSame( $heart_id, $data['reaction_summary']['2764']['current_user_reaction'] );
+
+		$this->assertArrayHasKey( '1f680', $data['reaction_summary'] );
+		$this->assertSame( 1, $data['reaction_summary']['1f680']['count'] );
+		$this->assertSame( 0, $data['reaction_summary']['1f680']['current_user_reaction'] );
+	}
+
+	/**
+	 * A note's `children` link keeps targeting its reply notes once reactions exist.
+	 *
+	 * Reactions are summarized in `reaction_summary`, so they neither change
+	 * where the link points nor make a note without replies advertise one.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_note_children_link_ignores_reactions() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments/' . $note_id );
+		$request->set_param( 'context', 'edit' );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertArrayNotHasKey( 'children', $response->get_links(), 'A note with only reactions should not advertise children.' );
+
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Reply note',
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$links    = $response->get_links();
+
+		$this->assertArrayHasKey( 'children', $links, 'A note with a reply should advertise children.' );
+		$href = $links['children'][0]['href'];
+		$this->assertStringContainsString( 'type=note', $href );
+		$this->assertStringNotContainsString( 'type=reaction', $href );
+	}
+
+	/**
+	 * A reaction may only be added on the current user's own behalf.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_cannot_be_attributed_to_another_user() {
+		wp_set_current_user( self::$admin_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$admin_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+					'author'  => self::$editor_id,
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_comment_invalid_author', $response, 403 );
+		$this->assertCount(
+			0,
+			get_comments(
+				array(
+					'parent' => $note_id,
+					'type'   => 'reaction',
+					'status' => 'approve',
+				)
+			),
+			'No reaction should have been stored.'
+		);
+	}
+
+	/**
+	 * Author fields in the request must not detach a reaction from its user.
+	 *
+	 * A reaction stored with `user_id` 0 is invisible to the uniqueness check and
+	 * to `reaction_summary`, so it could be added repeatedly and never removed.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_ignores_request_author_fields() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$body = wp_json_encode(
+			array(
+				'post'         => $post_id,
+				'parent'       => $note_id,
+				'content'      => '2764',
+				'type'         => 'reaction',
+				'author_name'  => 'Someone Else',
+				'author_email' => 'someone@example.com',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body( $body );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 201, $response->get_status() );
+
+		$data     = $response->get_data();
+		$reaction = get_comment( $data['id'] );
+		$this->assertSame( (string) self::$editor_id, $reaction->user_id, 'The reaction should belong to the current user.' );
+		$this->assertNotSame( 'someone@example.com', $reaction->comment_author_email );
+
+		// The uniqueness check can now see the stored reaction.
+		$duplicate = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$duplicate->add_header( 'Content-Type', 'application/json' );
+		$duplicate->set_body( $body );
+
+		$this->assertErrorResponse( 'rest_comment_duplicate_reaction', rest_get_server()->dispatch( $duplicate ), 409 );
+	}
+
+	/**
+	 * Removing a reaction takes it out of the note's summary.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_delete_reaction() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create();
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		$response = rest_get_server()->dispatch( new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $reaction_id ) );
+
+		$this->assertSame( 200, $response->get_status() );
+
+		$note    = rest_get_server()->dispatch( new WP_REST_Request( 'GET', '/wp/v2/comments/' . $note_id ) );
+		$summary = $note->get_data()['reaction_summary'];
+		$this->assertSame( array(), $summary, 'The removed reaction should no longer be summarized.' );
+	}
+
+	/**
+	 * A user who cannot edit the note's post cannot remove a reaction on it.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_delete_reaction_requires_edit_permission() {
+		$post_id     = self::factory()->post->create();
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_set_current_user( self::$subscriber_id );
+
+		$response = rest_get_server()->dispatch( new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $reaction_id ) );
+
+		$this->assertErrorResponse( 'rest_cannot_delete', $response, 403 );
+		$this->assertNotNull( get_comment( $reaction_id ) );
+	}
+
+	/**
+	 * A user with moderate_comments but no editing capabilities cannot remove a
+	 * reaction on a post they cannot edit.
+	 *
+	 * @ticket 66406
+	 */
+	public function test_moderator_cannot_delete_reaction() {
+		$post_id     = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_set_current_user( self::$moderator_id );
+
+		$request = new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $reaction_id );
+		$request->set_param( 'force', true );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_delete', $response, 403 );
+		$this->assertNotNull( get_comment( $reaction_id ), 'Reaction must still exist.' );
+	}
+
+	/**
+	 * A reaction's author can remove it from a note somebody else wrote.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_delete_own_reaction_on_another_users_note() {
+		$post_id     = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$admin_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_set_current_user( self::$editor_id );
+
+		$request = new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $reaction_id );
+		$request->set_param( 'force', true );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertNull( get_comment( $reaction_id ) );
+	}
+
+	/**
+	 * A reaction speaks for its author, so being able to edit the post is not
+	 * enough to remove someone else's.
+	 *
+	 * @ticket 66447
+	 *
+	 * @dataProvider data_users_who_cannot_delete_another_users_reaction
+	 *
+	 * @param string $user Name of the static property holding the user ID.
+	 */
+	public function test_cannot_delete_another_users_reaction( string $user ): void {
+		$post_id     = self::factory()->post->create( array( 'post_author' => self::$author_id ) );
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_set_current_user( self::${$user} );
+
+		$request = new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $reaction_id );
+		$request->set_param( 'force', true );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_delete', $response, 403 );
+		$this->assertNotNull( get_comment( $reaction_id ), 'Reaction must still exist.' );
+	}
+
+	/**
+	 * Data provider for test_cannot_delete_another_users_reaction().
+	 *
+	 * @return array<string, array{string}>
+	 */
+	public static function data_users_who_cannot_delete_another_users_reaction(): array {
+		return array(
+			'post author'   => array( 'author_id' ),
+			'administrator' => array( 'admin_id' ),
+		);
+	}
+
+	/**
+	 * Reactions on a resolved thread are frozen, like adding new ones, on the
+	 * root note and on its replies.
+	 *
+	 * @ticket 66447
+	 *
+	 * @dataProvider data_resolved_thread_targets
+	 *
+	 * @param bool $on_reply Whether the reaction is on a reply rather than the root note.
+	 */
+	public function test_cannot_delete_reaction_on_resolved_thread( bool $on_reply ): void {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$target  = $note_id;
+		if ( $on_reply ) {
+			$target = self::factory()->comment->create(
+				array(
+					'comment_post_ID'  => $post_id,
+					'comment_parent'   => $note_id,
+					'comment_type'     => 'note',
+					'comment_approved' => 0,
+					'user_id'          => self::$editor_id,
+					'comment_content'  => 'Test reply',
+				)
+			);
+		}
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $target,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+		wp_set_comment_status( $note_id, 'approve' );
+
+		$request = new WP_REST_Request( 'DELETE', '/wp/v2/comments/' . $reaction_id );
+		$request->set_param( 'force', true );
+		$response = rest_get_server()->dispatch( $request );
+
+		$this->assertErrorResponse( 'rest_cannot_delete', $response, 403 );
+		$this->assertNotNull( get_comment( $reaction_id ), 'Reaction must still exist.' );
+	}
+
+	/**
+	 * A reaction cannot be added to a trashed or spammed note, where it would
+	 * escape the trash cascade.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_hidden_note_statuses
+	 *
+	 * @param string $status Status to move the parent note to.
+	 */
+	public function test_create_reaction_on_hidden_note( $status ) {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		wp_set_comment_status( $note_id, $status );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_parent', $response, 400 );
+	}
+
+	/**
+	 * Data provider for test_create_reaction_on_hidden_note().
+	 *
+	 * @return array[]
+	 */
+	public static function data_hidden_note_statuses() {
+		return array(
+			'trash' => array( 'trash' ),
+			'spam'  => array( 'spam' ),
+		);
+	}
+
+	/**
+	 * Resolving a thread approves its root note and the editor disables
+	 * reactions from then on, so the server rejects them too, on the root
+	 * note and on its replies.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_resolved_thread_targets
+	 *
+	 * @param bool $on_reply Whether to react to a reply rather than the root note.
+	 */
+	public function test_create_reaction_on_resolved_thread( $on_reply ) {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$target  = $note_id;
+		if ( $on_reply ) {
+			$target = self::factory()->comment->create(
+				array(
+					'comment_post_ID'  => $post_id,
+					'comment_parent'   => $note_id,
+					'comment_type'     => 'note',
+					'comment_approved' => 0,
+					'user_id'          => self::$editor_id,
+					'comment_content'  => 'Test reply',
+				)
+			);
+		}
+		wp_set_comment_status( $note_id, 'approve' );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $target,
+					'content' => '2764',
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_parent', $response, 400 );
+		$this->assertSame( 'A reaction cannot be added to a resolved note.', $response->as_error()->get_error_message() );
+	}
+
+	/**
+	 * Data provider for test_create_reaction_on_resolved_thread() and
+	 * test_cannot_delete_reaction_on_resolved_thread().
+	 *
+	 * @return array[]
+	 */
+	public static function data_resolved_thread_targets() {
+		return array(
+			'root note' => array( false ),
+			'reply'     => array( true ),
+		);
+	}
+
+	/**
+	 * A note on a post the user cannot edit gets the same error whatever its
+	 * status, so a reaction request cannot reveal whether that note is
+	 * trashed, spammed or resolved.
+	 *
+	 * @ticket 64638
+	 *
+	 * @dataProvider data_other_post_note_states
+	 *
+	 * @param string $state The state to put the other post's note in.
+	 */
+	public function test_create_reaction_on_note_from_uneditable_post_does_not_reveal_its_status( $state ) {
+		$own_post_id   = self::factory()->post->create( array( 'post_author' => self::$author_id ) );
+		$other_post_id = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id       = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $other_post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Note on another post',
+			)
+		);
+		if ( 'open' !== $state ) {
+			wp_set_comment_status( $note_id, $state );
+		}
+
+		wp_set_current_user( self::$author_id );
+		$this->assertFalse( current_user_can( 'edit_post', $other_post_id ), 'The user should not be able to edit the other post.' );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $own_post_id,
+					'parent'  => $note_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertErrorResponse( 'rest_comment_invalid_parent', $response, 400 );
+		$this->assertSame( 'A reaction must be attached to a note on the same post.', $response->as_error()->get_error_message() );
+	}
+
+	/**
+	 * Data provider for test_create_reaction_on_note_from_uneditable_post_does_not_reveal_its_status().
+	 *
+	 * @return array[]
+	 */
+	public static function data_other_post_note_states() {
+		return array(
+			'open'     => array( 'open' ),
+			'trash'    => array( 'trash' ),
+			'spam'     => array( 'spam' ),
+			'resolved' => array( 'approve' ),
+		);
+	}
+
+	/**
+	 * Reactions are an internal comment type and are not world-readable, even
+	 * when approved on a public post. Only the reacting user or a user who can
+	 * edit the comment can read one.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_reaction_is_not_publicly_readable() {
+		$post_id     = self::factory()->post->create(
+			array(
+				'post_status' => 'publish',
+				'post_author' => self::$editor_id,
+			)
+		);
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments/' . $reaction_id );
+
+		wp_set_current_user( 0 );
+		$this->assertErrorResponse( 'rest_cannot_read', rest_get_server()->dispatch( $request ), 401 );
+
+		wp_set_current_user( self::$subscriber_id );
+		$this->assertErrorResponse( 'rest_cannot_read', rest_get_server()->dispatch( $request ), 403 );
+
+		wp_set_current_user( self::$editor_id );
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 200, $response->get_status(), 'The reacting user should be able to read their reaction.' );
+		$this->assertSame( $reaction_id, $response->get_data()['id'] );
+
+		wp_set_current_user( self::$admin_id );
+		$this->assertSame( 200, rest_get_server()->dispatch( $request )->get_status(), 'A user who can edit the reaction should be able to read it.' );
+	}
+
+	/**
+	 * A later page of notes summarizes its own notes' reactions with the same
+	 * two queries as the first page, rather than one query per note.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_second_page_of_notes_keeps_reaction_summary_queries_bounded() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id  = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_ids = self::factory()->comment->create_many(
+			4,
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		foreach ( $note_ids as $note_id ) {
+			self::factory()->comment->create(
+				array(
+					'comment_post_ID'  => $post_id,
+					'comment_type'     => 'reaction',
+					'comment_parent'   => $note_id,
+					'comment_approved' => 1,
+					'user_id'          => self::$editor_id,
+					'comment_content'  => '2764',
+				)
+			);
+		}
+
+		$summary_queries = 0;
+		$count_queries   = static function ( $query ) use ( &$summary_queries ) {
+			if ( str_contains( $query, "comment_type = 'reaction'" ) ) {
+				++$summary_queries;
+			}
+			return $query;
+		};
+		add_filter( 'query', $count_queries );
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'post', $post_id );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'status', 'all' );
+		$request->set_param( 'context', 'edit' );
+		$request->set_param( 'per_page', 2 );
+		$request->set_param( 'page', 2 );
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'query', $count_queries );
+
+		$data = $response->get_data();
+		$this->assertCount( 2, $data );
+		foreach ( $data as $note ) {
+			$this->assertSame( 1, $note['reaction_summary']['2764']['count'] );
+			$this->assertGreaterThan( 0, $note['reaction_summary']['2764']['current_user_reaction'] );
+		}
+
+		// One counts query and one current-user query for the whole page.
+		$this->assertSame( 2, $summary_queries );
+	}
+
+	/**
+	 * A reaction can be added to a reply in an open thread.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_create_reaction_on_reply_in_open_thread() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id  = self::factory()->post->create( array( 'post_author' => self::$editor_id ) );
+		$note_id  = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reply_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => $post_id,
+				'comment_parent'   => $note_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test reply',
+			)
+		);
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/comments' );
+		$request->add_header( 'Content-Type', 'application/json' );
+		$request->set_body(
+			wp_json_encode(
+				array(
+					'post'    => $post_id,
+					'parent'  => $reply_id,
+					'content' => '2764',
+					'type'    => 'reaction',
+				)
+			)
+		);
+
+		$response = rest_get_server()->dispatch( $request );
+		$this->assertSame( 201, $response->get_status() );
+	}
+
+	/**
+	 * Listing notes returns each note's reaction summary without a per-note query.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_note_collection_includes_reaction_summary() {
+		wp_set_current_user( self::$editor_id );
+
+		$post_id  = self::factory()->post->create();
+		$note_ids = array();
+
+		for ( $i = 0; $i < 3; $i++ ) {
+			$note_id    = self::factory()->comment->create(
+				array(
+					'comment_post_ID'  => $post_id,
+					'comment_type'     => 'note',
+					'comment_approved' => 1,
+					'user_id'          => self::$editor_id,
+					'comment_content'  => 'Note ' . $i,
+				)
+			);
+			$note_ids[] = $note_id;
+
+			self::factory()->comment->create(
+				array(
+					'comment_post_ID'  => $post_id,
+					'comment_type'     => 'reaction',
+					'comment_parent'   => $note_id,
+					'comment_approved' => 1,
+					'user_id'          => self::$editor_id,
+					'comment_content'  => '2764',
+				)
+			);
+		}
+
+		$request = new WP_REST_Request( 'GET', '/wp/v2/comments' );
+		$request->set_param( 'type', 'note' );
+		$request->set_param( 'post', $post_id );
+		$request->set_param( 'context', 'edit' );
+
+		$queries_before = get_num_queries();
+		$response       = rest_get_server()->dispatch( $request );
+		$queries_after  = get_num_queries();
+
+		$this->assertSame( 200, $response->get_status() );
+
+		$data = $response->get_data();
+		$this->assertCount( 3, $data );
+
+		foreach ( $data as $note ) {
+			$this->assertArrayHasKey( 'reaction_summary', $note );
+			$this->assertSame( 1, $note['reaction_summary']['2764']['count'] );
+			$this->assertGreaterThan( 0, $note['reaction_summary']['2764']['current_user_reaction'] );
+		}
+
+		/*
+		 * Summaries are pre-fetched in two aggregated queries for the whole
+		 * collection. Pin a ceiling well under one query per note so a
+		 * regression back to the N+1 path is caught.
+		 */
+		$this->assertLessThan(
+			$queries_before + 20,
+			$queries_after,
+			'Listing notes should not run a reaction query per note.'
+		);
+	}
+
+	/**
+	 * A note is not readable, and so neither is its reaction summary, without permission.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_reaction_summary_is_not_exposed_to_logged_out_users() {
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_set_current_user( 0 );
+
+		$response = rest_get_server()->dispatch( new WP_REST_Request( 'GET', '/wp/v2/comments/' . $note_id ) );
+
+		$this->assertErrorResponse( 'rest_cannot_read', $response, 401 );
+	}
+
+	/**
+	 * Reactions from several users are counted together, and the current user's
+	 * own row is the one reported back.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_reaction_summary_counts_reactions_from_multiple_users() {
+		$note_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+
+		$their_reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$admin_id,
+				'comment_content'  => '2764',
+			)
+		);
+		$my_reaction_id    = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_set_current_user( self::$editor_id );
+
+		$response = rest_get_server()->dispatch( new WP_REST_Request( 'GET', '/wp/v2/comments/' . $note_id ) );
+		$summary  = $response->get_data()['reaction_summary'];
+
+		$this->assertSame( 2, $summary['2764']['count'], 'Both users should be counted under the same emoji.' );
+		$this->assertSame( $my_reaction_id, $summary['2764']['current_user_reaction'] );
+		$this->assertNotSame( $their_reaction_id, $summary['2764']['current_user_reaction'] );
+	}
+
+	/**
+	 * A trashed reaction drops out of the summary.
+	 *
+	 * @ticket 64638
+	 */
+	public function test_reaction_summary_excludes_trashed_reactions() {
+		wp_set_current_user( self::$editor_id );
+
+		$note_id     = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'note',
+				'comment_approved' => 0,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => 'Test note',
+			)
+		);
+		$reaction_id = self::factory()->comment->create(
+			array(
+				'comment_post_ID'  => self::$post_id,
+				'comment_type'     => 'reaction',
+				'comment_parent'   => $note_id,
+				'comment_approved' => 1,
+				'user_id'          => self::$editor_id,
+				'comment_content'  => '2764',
+			)
+		);
+
+		wp_trash_comment( $reaction_id );
+
+		$response = rest_get_server()->dispatch( new WP_REST_Request( 'GET', '/wp/v2/comments/' . $note_id ) );
+
+		$this->assertSame( array(), $response->get_data()['reaction_summary'] );
+	}
+}

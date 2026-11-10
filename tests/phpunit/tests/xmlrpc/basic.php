@@ -1,0 +1,454 @@
+<?php
+
+require_once ABSPATH . 'wp-admin/includes/admin.php';
+require_once ABSPATH . WPINC . '/class-IXR.php';
+require_once ABSPATH . WPINC . '/class-wp-xmlrpc-server.php';
+
+/**
+ * @group xmlrpc
+ */
+class Tests_XMLRPC_Basic extends WP_XMLRPC_UnitTestCase {
+	public function test_enabled() {
+		$result = $this->myxmlrpcserver->wp_getOptions( array( 1, 'username', 'password' ) );
+
+		$this->assertIXRError( $result );
+		// If disabled, 405 would result.
+		$this->assertSame( 403, $result->code );
+	}
+
+	public function test_login_pass_ok() {
+		$this->make_user_by_role( 'subscriber' );
+
+		$this->assertTrue( $this->myxmlrpcserver->login_pass_ok( 'subscriber', 'subscriber' ) );
+		$this->assertInstanceOf( 'WP_User', $this->myxmlrpcserver->login( 'subscriber', 'subscriber' ) );
+	}
+
+	public function test_login_pass_bad() {
+		$this->make_user_by_role( 'subscriber' );
+
+		$this->assertFalse( $this->myxmlrpcserver->login_pass_ok( 'username', 'password' ) );
+		$this->assertFalse( $this->myxmlrpcserver->login( 'username', 'password' ) );
+
+		// The auth will still fail due to authentication blocking after the first failed attempt.
+		$this->assertFalse( $this->myxmlrpcserver->login_pass_ok( 'subscriber', 'subscriber' ) );
+	}
+
+	/**
+	 * Tests that non-scalar credentials return an error instead of causing a fatal error.
+	 *
+	 * @ticket 66168
+	 *
+	 * @covers wp_xmlrpc_server::login
+	 *
+	 * @dataProvider data_login_rejects_non_scalar_credentials
+	 *
+	 * @param mixed $username The username argument.
+	 * @param mixed $password The password argument.
+	 */
+	public function test_login_rejects_non_scalar_credentials( $username, $password ): void {
+		$this->make_user_by_role( 'subscriber' );
+
+		$this->assertFalse( $this->myxmlrpcserver->login( $username, $password ) );
+		$this->assertIXRError( $this->myxmlrpcserver->error );
+		$this->assertSame( 400, $this->myxmlrpcserver->error->code );
+
+		// A rejected request is not a failed login attempt, so a valid login should still succeed.
+		$this->assertInstanceOf( WP_User::class, $this->myxmlrpcserver->login( 'subscriber', 'subscriber' ) );
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<non-falsy-string, array{ 0: mixed, 1: mixed }>
+	 */
+	public static function data_login_rejects_non_scalar_credentials(): array {
+		return array(
+			'array username'      => array( array( 'subscriber' ), 'subscriber' ),
+			'array password'      => array( 'subscriber', array( 'subscriber' ) ),
+			'IXR_Base64 password' => array( 'subscriber', new IXR_Base64( 'subscriber' ) ),
+			'null username'       => array( null, 'subscriber' ),
+			'null password'       => array( 'subscriber', null ),
+		);
+	}
+
+	/**
+	 * Tests that integer credentials are still passed through to authentication.
+	 *
+	 * @ticket 66168
+	 *
+	 * @covers wp_xmlrpc_server::login
+	 */
+	public function test_login_passes_integer_credentials_to_authentication(): void {
+		$this->assertFalse( $this->myxmlrpcserver->login( 12345, 67890 ) );
+		$this->assertIXRError( $this->myxmlrpcserver->error );
+		$this->assertSame( 403, $this->myxmlrpcserver->error->code );
+	}
+
+	/**
+	 * Tests that numeric credentials, which XML-RPC sends as `<int>` values,
+	 * continue to authenticate.
+	 *
+	 * @ticket 65600
+	 *
+	 * @covers wp_xmlrpc_server::login
+	 */
+	public function test_login_with_integer_credentials_succeeds(): void {
+		$user_id = self::factory()->user->create(
+			array(
+				'user_login' => '12345',
+				'user_pass'  => '67890',
+				'role'       => 'subscriber',
+			)
+		);
+
+		$user = $this->myxmlrpcserver->login( 12345, 67890 );
+		$this->assertInstanceOf( WP_User::class, $user, 'The login should succeed.' );
+		$this->assertSame( $user_id, $user->ID, 'The login should authenticate the user with the matching credentials.' );
+	}
+
+	/**
+	 * @ticket 34336
+	 */
+	public function test_multicall_invalidates_all_calls_after_invalid_call() {
+		$editor_id = $this->make_user_by_role( 'editor' );
+		$post_id   = self::factory()->post->create(
+			array(
+				'post_author' => $editor_id,
+			)
+		);
+
+		$method_calls = array(
+			// Valid login.
+			array(
+				'methodName' => 'wp.editPost',
+				'params'     => array(
+					0,
+					'editor',
+					'editor',
+					$post_id,
+					array(
+						'title' => 'Title 1',
+					),
+				),
+			),
+			// *Invalid* login.
+			array(
+				'methodName' => 'wp.editPost',
+				'params'     => array(
+					0,
+					'editor',
+					'password',
+					$post_id,
+					array(
+						'title' => 'Title 2',
+					),
+				),
+			),
+			// Valid login.
+			array(
+				'methodName' => 'wp.editPost',
+				'params'     => array(
+					0,
+					'editor',
+					'editor',
+					$post_id,
+					array(
+						'title' => 'Title 3',
+					),
+				),
+			),
+		);
+
+		$this->myxmlrpcserver->callbacks = $this->myxmlrpcserver->methods;
+
+		$result = $this->myxmlrpcserver->multiCall( $method_calls );
+
+		$this->assertArrayNotHasKey( 'faultCode', $result[0] );
+		$this->assertArrayHasKey( 'faultCode', $result[1] );
+		$this->assertArrayHasKey( 'faultCode', $result[2] );
+	}
+
+	/**
+	 * Tests that a multicall entry with non-array params returns a fault without stopping the remaining calls.
+	 *
+	 * @ticket 66160
+	 *
+	 * @covers IXR_Server::multiCall
+	 */
+	public function test_multicall_with_non_array_params(): void {
+		$this->myxmlrpcserver->callbacks = $this->myxmlrpcserver->methods;
+
+		$result = $this->myxmlrpcserver->multiCall(
+			array( // @phpstan-ignore argument.type (Intentionally passing non-array params.)
+				array(
+					'methodName' => 'demo.sayHello',
+					'params'     => 'x',
+				),
+				array(
+					'methodName' => 'demo.sayHello',
+					'params'     => array(),
+				),
+			)
+		);
+
+		$this->assertIsArray( $result );
+		$this->assertCount( 2, $result );
+		$this->assertArrayHasKey( 'faultCode', $result[0] );
+		$this->assertSame( -32602, $result[0]['faultCode'] );
+		$this->assertSame( array( 'Hello!' ), $result[1] );
+	}
+
+	/**
+	 * Tests that a multicall entry with a single-member struct as params passes the struct through intact.
+	 *
+	 * @ticket 66160
+	 *
+	 * @covers IXR_Server::call
+	 */
+	public function test_multicall_with_single_member_struct_params(): void {
+		$this->myxmlrpcserver->callbacks = array(
+			'test.echo' => array( $this, 'echo_args' ),
+		);
+
+		$result = $this->myxmlrpcserver->multiCall(
+			array(
+				array(
+					'methodName' => 'test.echo',
+					'params'     => array( 'foo' => 'bar' ),
+				),
+			)
+		);
+
+		$this->assertSame( array( array( array( 'foo' => 'bar' ) ) ), $result );
+	}
+
+	/**
+	 * Returns the args passed to an XML-RPC method callback.
+	 *
+	 * @param mixed $args Method args.
+	 * @return mixed The args.
+	 */
+	public function echo_args( $args ) {
+		return $args;
+	}
+
+	/**
+	 * Tests that a multicall entry with missing params does not cause a fatal error.
+	 *
+	 * @ticket 66160
+	 *
+	 * @covers IXR_Server::multiCall
+	 */
+	public function test_multicall_with_missing_params(): void {
+		$this->myxmlrpcserver->callbacks = $this->myxmlrpcserver->methods;
+
+		$result = $this->myxmlrpcserver->multiCall(
+			array(
+				array(
+					'methodName' => 'demo.sayHello',
+				),
+			)
+		);
+
+		$this->assertSame( array( array( 'Hello!' ) ), $result );
+	}
+
+	/**
+	 * Tests that a system.multicall call with a non-array argument returns a fault.
+	 *
+	 * @ticket 66160
+	 *
+	 * @covers IXR_Server::multiCall
+	 */
+	public function test_multicall_with_non_array_argument(): void {
+		$this->myxmlrpcserver->callbacks = $this->myxmlrpcserver->methods;
+
+		$result = $this->myxmlrpcserver->multiCall( 'x' ); // @phpstan-ignore argument.type (Intentionally passing a non-array argument.)
+
+		$this->assertIXRError( $result );
+		$this->assertSame( -32600, $result->code );
+	}
+
+	/**
+	 * Tests that a non-struct multicall entry returns a fault without stopping the remaining calls.
+	 *
+	 * @ticket 66160
+	 *
+	 * @covers IXR_Server::multiCall
+	 */
+	public function test_multicall_with_non_struct_entry(): void {
+		$this->myxmlrpcserver->callbacks = $this->myxmlrpcserver->methods;
+
+		$result = $this->myxmlrpcserver->multiCall(
+			array( // @phpstan-ignore argument.type (Intentionally passing a non-struct entry.)
+				'x',
+				array(
+					'methodName' => 'demo.sayHello',
+					'params'     => array(),
+				),
+			)
+		);
+
+		$this->assertIsArray( $result );
+		$this->assertCount( 2, $result );
+		$this->assertArrayHasKey( 'faultCode', $result[0] );
+		$this->assertSame( -32600, $result[0]['faultCode'] );
+		$this->assertSame( array( 'Hello!' ), $result[1] );
+	}
+
+	/**
+	 * Tests that a multicall entry with no methodName returns a fault without stopping the remaining calls.
+	 *
+	 * @ticket 66160
+	 *
+	 * @covers IXR_Server::multiCall
+	 */
+	public function test_multicall_with_missing_method_name(): void {
+		$this->myxmlrpcserver->callbacks = $this->myxmlrpcserver->methods;
+
+		$result = $this->myxmlrpcserver->multiCall(
+			array( // @phpstan-ignore argument.type (Intentionally omitting methodName.)
+				array( 'params' => array() ),
+				array(
+					'methodName' => 'demo.sayHello',
+					'params'     => array(),
+				),
+			)
+		);
+
+		$this->assertIsArray( $result );
+		$this->assertCount( 2, $result );
+		$this->assertArrayHasKey( 'faultCode', $result[0] );
+		$this->assertSame( -32600, $result[0]['faultCode'] );
+		$this->assertSame( array( 'Hello!' ), $result[1] );
+	}
+
+	/**
+	 * Tests that a multicall entry returning a non-object result is not treated as an error.
+	 *
+	 * @ticket 66418
+	 *
+	 * @covers IXR_Server::multiCall
+	 *
+	 * @dataProvider data_multicall_with_non_object_result
+	 *
+	 * @param mixed $value The value the method returns.
+	 */
+	public function test_multicall_with_non_object_result( $value ): void {
+		$this->myxmlrpcserver->callbacks = array(
+			'test.echo' => array( $this, 'echo_args' ),
+		);
+
+		$result = $this->myxmlrpcserver->multiCall(
+			array(
+				array(
+					'methodName' => 'test.echo',
+					'params'     => array( $value ),
+				),
+			)
+		);
+
+		$this->assertSame( array( array( $value ) ), $result );
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<non-falsy-string, array{ 0: mixed }>
+	 */
+	public static function data_multicall_with_non_object_result(): array {
+		return array(
+			'string'           => array( 'IXR_Error' ),
+			'integer'          => array( 42 ),
+			'boolean'          => array( true ),
+			'non-struct array' => array( array( 'IXR_Error' ) ),
+		);
+	}
+
+	/**
+	 * Tests that the introspection server rejects a non-object argument for a date parameter.
+	 *
+	 * @ticket 66418
+	 *
+	 * @covers IXR_IntrospectionServer::call
+	 *
+	 * @dataProvider data_introspection_server_rejects_non_date_argument
+	 *
+	 * @param mixed $arg The argument passed for the date parameter.
+	 */
+	public function test_introspection_server_rejects_non_date_argument( $arg ): void {
+		$server = new IXR_IntrospectionServer();
+		$server->addCallback( 'test.echo', array( $this, 'echo_args' ), array( 'string', 'dateTime.iso8601' ), 'Echoes a date.' );
+
+		$result = $server->call( 'test.echo', array( $arg ) );
+
+		$this->assertIXRError( $result, 'A non-date argument should return an IXR_Error.' );
+		$this->assertSame( -32602, $result->code, 'The error code should indicate invalid method parameters.' );
+		$this->assertSame( 'server error. invalid method parameters', $result->message, 'The error message should indicate an invalid parameter type rather than a wrong parameter count.' );
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array<non-falsy-string, array{ 0: mixed }>
+	 */
+	public static function data_introspection_server_rejects_non_date_argument(): array {
+		return array(
+			'date string' => array( '20261030T12:00:00' ),
+			'class name'  => array( 'IXR_Date' ),
+			'integer'     => array( 1793361600 ),
+		);
+	}
+
+	/**
+	 * Tests that the introspection server accepts an IXR_Date argument for a date parameter.
+	 *
+	 * @ticket 66418
+	 *
+	 * @covers IXR_IntrospectionServer::call
+	 */
+	public function test_introspection_server_accepts_date_argument(): void {
+		$server = new IXR_IntrospectionServer();
+		$server->addCallback( 'test.echo', array( $this, 'echo_args' ), array( 'string', 'dateTime.iso8601' ), 'Echoes a date.' );
+
+		$date   = new IXR_Date( '20261030T12:00:00' );
+		$result = $server->call( 'test.echo', array( $date ) );
+
+		$this->assertSame( $date, $result );
+	}
+
+	/**
+	 * Tests that IXR_Value encodes IXR_Date and IXR_Base64 objects as their XML-RPC types, and strings as strings.
+	 *
+	 * @ticket 66418
+	 *
+	 * @covers IXR_Value::calculateType
+	 */
+	public function test_ixr_value_calculate_type(): void {
+		$this->assertSame( 'date', ( new IXR_Value( new IXR_Date( '20261030T12:00:00' ) ) )->calculateType(), 'An IXR_Date object should be typed as a date.' );
+		$this->assertSame( 'base64', ( new IXR_Value( new IXR_Base64( 'data' ) ) )->calculateType(), 'An IXR_Base64 object should be typed as base64.' );
+		$this->assertSame( 'string', ( new IXR_Value( 'IXR_Date' ) )->calculateType(), 'A string matching a class name should be typed as a string.' );
+	}
+
+	/**
+	 * @ticket 36586
+	 */
+	public function test_isStruct_on_non_numerically_indexed_array() {
+		$value = new IXR_Value( array( '0.0' => 100 ) );
+
+		$return  = "<struct>\n";
+		$return .= "  <member><name>0.0</name><value><int>100</int></value></member>\n";
+		$return .= '</struct>';
+
+		$this->assertXmlStringEqualsXmlString( $return, $value->getXML() );
+	}
+
+	public function test_disabled() {
+		add_filter( 'xmlrpc_enabled', '__return_false' );
+		$testcase_xmlrpc_server = new wp_xmlrpc_server();
+		$result                 = $testcase_xmlrpc_server->wp_getOptions( array( 1, 'username', 'password' ) );
+
+		$this->assertIXRError( $result );
+		$this->assertSame( 405, $result->code );
+	}
+}
